@@ -2,7 +2,7 @@ import json
 import random
 
 
-def load_pool(path="gen9_ou_20mons.json"):
+def load_pool(path="team_pool.json"):
     """Load your 20-Pokémon JSON pool."""
     with open(path, "r") as f:
         return json.load(f)
