@@ -1,0 +1,40 @@
+# Configuration for Pokémon Battle RL Agent
+
+# Agent settings
+agent:
+  num_actions: 7  # Number of heuristic actions
+  state_dim: 80  # Feature vector dimension
+  learning_rate: 0.01  # Policy gradient learning rate
+  epsilon_start: 0.5  # Initial exploration rate
+  epsilon_end: 0.01  # Final exploration rate
+  epsilon_decay: 0.995  # Decay per episode
+
+# Training settings
+training:
+  num_episodes: 1000  # Total episodes
+  batch_size: 10  # Episodes per update
+  use_baseline: true  # Use reward baseline (reduces variance)
+  
+# Rewards
+rewards:
+  win: 1.0
+  loss: -1.0
+  step_penalty: -0.01
+  ko_bonus: 0.2  # Optional: bonus for KOing opponent
+  lose_penalty: -0.2  # Optional: penalty for losing mon
+
+# Battle settings
+battle:
+  format: "gen9randombattle"  # Random Battle format (auto-generates teams)
+  team_size: 6  # Team size
+  max_turns: 200  # Max turns per battle
+
+# Training phases
+phases:
+  phase1_bot: "Random"  # Initial bot opponent
+  phase1_episodes: 300
+  phase2_bot: "MaxDamage"  # Stronger bot
+  phase2_episodes: 300
+  phase3_selfplay: true  # Self-play phase
+  phase3_episodes: 400
+
