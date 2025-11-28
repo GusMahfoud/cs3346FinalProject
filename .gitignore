@@ -1,3 +1,5 @@
 .venv
 .pokemon-showdown
 __pycache__
+.pokeenv310
+.showdownenv
