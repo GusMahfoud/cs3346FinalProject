@@ -48,7 +48,7 @@ def format_team_for_showdown(team):
     return "\n".join(lines).strip()
 
 
-def generate_two_random_teams(path="gen9_ou_20mons.json", seed=None):
+def generate_two_random_teams(path="team_pool.json", seed=None):
     """Load pool → generate Team A + Team B → return formatted strings."""
     pool = load_pool(path)
 
