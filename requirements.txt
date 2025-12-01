@@ -1,0 +1,6 @@
+poke_env==0.10.0
+numpy==2.3.5
+torch==2.9.1
+websockets==15.0.1
+requests==2.32.5
+
