@@ -12,6 +12,8 @@ from poke_env.battle.field import Field
 # And you SHOULD also import Battle from the same directory:
 from poke_env.battle.battle import Battle
 
+from rewards import RewardCalculator
+
 # -----------------------------
 # CONSTANTS
 # -----------------------------
@@ -152,7 +154,13 @@ def encode_weather_and_terrain(battle):
     weather_one_hot = [0.0] * len(WEATHER_KEYS)
     weather_duration = 0.0
     if battle.weather:
-        w, turns = battle.weather
+        # Handle both tuple (weather, turns) and single weather value
+        if isinstance(battle.weather, tuple) and len(battle.weather) == 2:
+            w, turns = battle.weather
+        else:
+            # Just weather value, no turns info
+            w = battle.weather
+            turns = 0  # Unknown duration
         if w in WEATHER_KEYS:
             weather_one_hot[WEATHER_KEYS.index(w)] = 1.0
         weather_duration = min(turns, 8) / 8.0
@@ -220,11 +228,17 @@ class MyRLAgent(Player):
     - 10 discrete actions (4 moves + 6 switch options)
     - Rich game state encoding tailored to the 20-Pokémon mini-meta
     - Random policy by default (plug your model into compute_policy)
+    - Integrated rewards system for RL training
     """
 
     def __init__(self, battle_format="gen9ou", **kwargs):
         super().__init__(battle_format=battle_format, **kwargs)
         self.action_size = 10
+        self.reward_calc = RewardCalculator()
+        self.battle_history = []  # Store (state, action, reward) tuples
+        self.prev_battle_state = None
+        self.current_reward_score = 0.0
+        self.last_action_was_switch = False
 
     # -------------------------
     # POLICY / ACTION SELECTION
@@ -241,6 +255,16 @@ class MyRLAgent(Player):
 
     def choose_move(self, battle):
         """Main hook called by poke-env to choose an action."""
+        # Compute reward from previous turn if we have previous state
+        if self.prev_battle_state is not None and not battle.finished:
+            turn_reward = self.reward_calc.compute_turn_reward(
+                self.prev_battle_state,
+                battle,
+                action_was_switch=self.last_action_was_switch
+            )
+            self.current_reward_score += turn_reward
+        
+        # Encode current state
         state_vec = encode_state(battle)
         policy = self.compute_policy(state_vec)
 
@@ -250,9 +274,38 @@ class MyRLAgent(Player):
         legal = self.legal_actions(battle)
         if action_index not in legal:
             # Fallback: random legal action
-            return self.choose_random_legal_action(battle)
-
-        return self.action_to_move(action_index, battle)
+            move = self.choose_random_legal_action(battle)
+        else:
+            move = self.action_to_move(action_index, battle)
+        
+        # Track if this is a switch action
+        self.last_action_was_switch = (action_index >= 4)
+        
+        # Store current battle state for next turn (shallow copy key attributes)
+        self.prev_battle_state = self._copy_battle_state(battle)
+        
+        return move
+    
+    def _copy_battle_state(self, battle):
+        """Create a minimal copy of battle state for reward calculation."""
+        # Store key metrics we need for reward calculation
+        # This avoids issues with battle object mutation
+        state = {
+            'turn': battle.turn,
+            'team': {k: {
+                'current_hp': v.current_hp,
+                'max_hp': v.max_hp,
+                'fainted': v.fainted,
+                'status': v.status
+            } for k, v in battle.team.items()},
+            'opponent_team': {k: {
+                'current_hp': v.current_hp if v.current_hp is not None else 0,
+                'max_hp': v.max_hp if v.max_hp else 1,
+                'fainted': v.fainted,
+                'status': v.status
+            } for k, v in battle.opponent_team.items()}
+        }
+        return state
 
     # -------------------------
     # ACTION SPACE / MAPPING
@@ -306,4 +359,28 @@ class MyRLAgent(Player):
             # Let poke-env pick something completely random as a last resort
             return self.choose_random_move(battle)
         a = np.random.choice(legal)
-        return self.action_to_move(a, battle)
+        move = self.action_to_move(a, battle)
+        self.last_action_was_switch = (a >= 4)
+        return move
+    
+    def on_battle_end(self, battle):
+        """Called when battle ends - compute terminal reward."""
+        # Compute final turn reward if we have previous state
+        if self.prev_battle_state is not None:
+            turn_reward = self.reward_calc.compute_turn_reward(
+                self.prev_battle_state,
+                battle,
+                action_was_switch=self.last_action_was_switch
+            )
+            self.current_reward_score += turn_reward
+        
+        # Compute terminal reward
+        terminal_reward = self.reward_calc.compute_terminal_reward(battle)
+        self.current_reward_score += terminal_reward
+        
+        # Reset for next battle
+        self.reward_calc.reset()
+        self.prev_battle_state = None
+        self.current_reward_score = 0.0
+        self.last_action_was_switch = False
+        self.battle_history = []
