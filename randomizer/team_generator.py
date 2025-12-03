@@ -1,71 +1,51 @@
 import json
 import random
 
+def format_evs(evs):
+    parts = []
+    if evs["hp"] > 0: parts.append(f'{evs["hp"]} HP')
+    if evs["atk"] > 0: parts.append(f'{evs["atk"]} Atk')
+    if evs["def"] > 0: parts.append(f'{evs["def"]} Def')
+    if evs["spa"] > 0: parts.append(f'{evs["spa"]} SpA')
+    if evs["spd"] > 0: parts.append(f'{evs["spd"]} SpD')
+    if evs["spe"] > 0: parts.append(f'{evs["spe"]} Spe')
+    return " / ".join(parts)
 
-def load_pool(path="team_pool.json"):
-    """Load your 20-Pokémon JSON pool."""
-    with open(path, "r") as f:
+def format_ivs(ivs):
+    parts = []
+    parts.append(f'{ivs["hp"]} HP')
+    parts.append(f'{ivs["atk"]} Atk')
+    parts.append(f'{ivs["def"]} Def')
+    parts.append(f'{ivs["spa"]} SpA')
+    parts.append(f'{ivs["spd"]} SpD')
+    parts.append(f'{ivs["spe"]} Spe')
+    return " / ".join(parts)
+
+def mon_to_showdown(mon):
+    s = []
+    s.append(f'{mon["species"]} @ {mon["item"]}')
+    s.append(f'Ability: {mon["ability"]}')
+    s.append(f'{mon["nature"]} Nature')
+
+    # EVs
+    ev_line = format_evs(mon["evs"])
+    if ev_line:
+        s.append(f'EVs: {ev_line}')
+
+    # IVs always included
+    iv_line = format_ivs(mon["ivs"])
+    s.append(f'IVs: {iv_line}')
+
+    # Moves
+    for m in mon["moves"]:
+        s.append(f'- {m}')
+
+    return "\n".join(s)
+
+def load_pool(json_path="teams/team_pool.json"):
+    with open(json_path, "r") as f:
         return json.load(f)
 
-
-def sample_team(pool, size=6, seed=None):
-    """Pick size unique Pokémon from the pool."""
-    if seed is not None:
-        random.seed(seed)
-    return random.sample(pool, size)
-
-
-def format_team_for_showdown(team):
-    """Convert Pokémon dicts into a valid Showdown importable team string."""
-    lines = []
-
-    for mon in team:
-        # Header line
-        lines.append(f"{mon['species']} @ {mon['item']}")
-        lines.append(f"Ability: {mon['ability']}")
-
-        # EVs
-        evs = mon["evs"]
-        ev_parts = [f"{value} {stat.upper()}" for stat, value in evs.items() if value > 0]
-        if ev_parts:
-            lines.append(f"EVs: {' / '.join(ev_parts)}")
-
-        # Nature
-        lines.append(f"{mon['nature']} Nature")
-
-        # IVs (only list non-31)
-        ivs = mon["ivs"]
-        iv_parts = [f"{value} {stat.upper()}" for stat, value in ivs.items() if value != 31]
-        if iv_parts:
-            lines.append(f"IVs: {' / '.join(iv_parts)}")
-
-        # Moves
-        for move in mon["moves"]:
-            lines.append(f"- {move}")
-
-        lines.append("")  # blank line between Pokémon
-
-    return "\n".join(lines).strip()
-
-
-def generate_two_random_teams(path="team_pool.json", seed=None):
-    """Load pool → generate Team A + Team B → return formatted strings."""
-    pool = load_pool(path)
-
-    teamA = sample_team(pool, 6, seed)
-    teamB = sample_team(pool, 6, None if seed is None else seed + 1)
-
-    teamA_str = format_team_for_showdown(teamA)
-    teamB_str = format_team_for_showdown(teamB)
-
-    return teamA_str, teamB_str
-
-
-if __name__ == "__main__":
-    teamA, teamB = generate_two_random_teams()
-
-    print("\n===== TEAM A =====\n")
-    print(teamA)
-
-    print("\n===== TEAM B =====\n")
-    print(teamB)
+def generate_team_from_pool(pool, size=6):
+    mons = random.sample(pool, size)
+    return "\n\n".join(mon_to_showdown(mon) for mon in mons)
