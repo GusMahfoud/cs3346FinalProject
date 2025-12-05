@@ -1,6 +1,12 @@
 from poke_env.player.player import Player
 
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import json
+import os
+from collections import deque
 
 # Correct engine modules (found on your system)
 from poke_env.battle.pokemon import Pokemon
@@ -219,6 +225,27 @@ def encode_state(battle):
     return np.array(vec, dtype=np.float32)
 
 # -----------------------------
+# MLP MODEL
+# -----------------------------
+
+class MLPPolicy(nn.Module):
+    """Simple MLP for policy learning."""
+    
+    def __init__(self, state_size, action_size=10, hidden_size=128):
+        super(MLPPolicy, self).__init__()
+        self.fc1 = nn.Linear(state_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc3 = nn.Linear(hidden_size, action_size)
+        self.relu = nn.ReLU()
+        
+    def forward(self, state):
+        """Forward pass: state -> action logits."""
+        x = self.relu(self.fc1(state))
+        x = self.relu(self.fc2(x))
+        logits = self.fc3(x)
+        return logits
+
+# -----------------------------
 # RL AGENT
 # -----------------------------
 
@@ -231,27 +258,104 @@ class MyRLAgent(Player):
     - Integrated rewards system for RL training
     """
 
-    def __init__(self, battle_format="gen9ou", **kwargs):
+    def __init__(self, battle_format="gen9ou", learning_rate=0.0003, batch_size=32, gamma=0.95, 
+                 epsilon_start=1.0, epsilon_end=0.05, epsilon_decay=0.998, model_path=None, **kwargs):
         super().__init__(battle_format=battle_format, **kwargs)
         self.action_size = 10
         self.reward_calc = RewardCalculator()
-        self.battle_history = []  # Store (state, action, reward) tuples
+        self.battle_history = []  # Store (state, action, reward) tuples for current battle
+        self.episode_buffer = []  # Store complete episodes (battles) for training
+        self.experience_buffer = []  # Store processed (state, action, return) tuples for batch training
         self.prev_battle_state = None
         self.current_reward_score = 0.0
         self.last_action_was_switch = False
+        
+        # MLP model setup
+        # Calculate state size dynamically (will be set on first encode_state call)
+        self.state_size = None
+        self.model = None
+        self.optimizer = None
+        self.batch_size = batch_size
+        self.gamma = gamma  # Discount factor for returns
+        self.learning_rate = learning_rate
+        
+        # Epsilon-greedy exploration
+        self.epsilon = epsilon_start
+        self.epsilon_start = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        
+        # Try to load existing model
+        if model_path:
+            if os.path.exists(model_path):
+                print(f"Model found: {model_path}")
+                self.load_model(os.path.basename(model_path))
+            else:
+                print(f"Model not found: {model_path}, creating new model")
+        else:
+            default_path = os.path.join("models", "mlp_model.pth")
+            if os.path.exists(default_path):
+                print(f"Model found: {default_path}")
+                self.load_model("mlp_model.pth")
+            else:
+                print("Model not found, creating new model")
+        
+        # Training stats
+        self.training_stats = {
+            'battles_completed': 0,
+            'wins': 0,
+            'losses': 0,
+            'draws': 0,
+            'total_reward': 0.0,
+            'avg_reward_per_battle': [],
+            'win_rate_history': []
+        }
 
     # -------------------------
     # POLICY / ACTION SELECTION
     # -------------------------
 
+    def _init_model(self, state_size, silent=False):
+        """Initialize MLP model on first use."""
+        if self.model is None:
+            self.state_size = state_size
+            self.model = MLPPolicy(state_size, self.action_size, hidden_size=128)
+            self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+            self.model.train()
+            if not silent:
+                print(f"Created new model (state_size={state_size}, hidden_size=128)")
+    
     def compute_policy(self, state_vec: np.ndarray) -> np.ndarray:
         """
-        Placeholder for your RL network.
-        Right now: uniform distribution (random strategy).
-        Replace this with your NN forward pass.
+        Compute policy using MLP.
+        Returns action probabilities.
         """
-        logits = np.ones(self.action_size, dtype=np.float32)
-        return logits / logits.sum()
+        # Initialize model on first call with max expected size
+        if self.model is None:
+            # Use a large fixed size to handle variable state vectors
+            # Pad/truncate to this size
+            max_state_size = 2000  # Large enough for any battle state
+            self._init_model(max_state_size)
+        
+        # Pad or truncate state vector to match model input size
+        current_size = len(state_vec)
+        if current_size < self.state_size:
+            # Pad with zeros
+            padded = np.zeros(self.state_size, dtype=np.float32)
+            padded[:current_size] = state_vec
+            state_vec = padded
+        elif current_size > self.state_size:
+            # Truncate
+            state_vec = state_vec[:self.state_size]
+        
+        # Convert to tensor and forward pass
+        self.model.eval()
+        state_tensor = torch.FloatTensor(state_vec).unsqueeze(0)
+        with torch.no_grad():
+            logits = self.model(state_tensor)
+            probs = torch.softmax(logits, dim=1)
+        
+        return probs.squeeze(0).numpy()
 
     def choose_move(self, battle):
         """Main hook called by poke-env to choose an action."""
@@ -263,20 +367,54 @@ class MyRLAgent(Player):
                 action_was_switch=self.last_action_was_switch
             )
             self.current_reward_score += turn_reward
+            
+            # Store experience: (prev_state, action, reward)
+            if len(self.battle_history) > 0:
+                # Update last entry with reward
+                prev_state, prev_action, _ = self.battle_history[-1]
+                self.battle_history[-1] = (prev_state, prev_action, turn_reward)
         
         # Encode current state
         state_vec = encode_state(battle)
-        policy = self.compute_policy(state_vec)
-
-        # Greedy action (you can sample instead if you want exploration)
-        action_index = int(np.argmax(policy))
-
         legal = self.legal_actions(battle)
-        if action_index not in legal:
-            # Fallback: random legal action
-            move = self.choose_random_legal_action(battle)
-        else:
+        
+        # Ensure model is initialized (needed even for exploration to track state)
+        if self.model is None:
+            max_state_size = 2000
+            self._init_model(max_state_size)
+        
+        # Epsilon-greedy action selection
+        if np.random.random() < self.epsilon:
+            # Explore: random legal action
+            action_index = np.random.choice(legal) if legal else 0
             move = self.action_to_move(action_index, battle)
+        else:
+            # Exploit: use policy
+            policy = self.compute_policy(state_vec)
+            
+            # Mask illegal actions
+            masked_policy = policy.copy()
+            for i in range(self.action_size):
+                if i not in legal:
+                    masked_policy[i] = 0.0
+            
+            # Normalize and sample from policy
+            if masked_policy.sum() > 0:
+                masked_policy = masked_policy / masked_policy.sum()
+                action_index = np.random.choice(self.action_size, p=masked_policy)
+            else:
+                # Fallback if all actions masked
+                action_index = np.random.choice(legal) if legal else 0
+
+            if action_index not in legal:
+                # Fallback: random legal action
+                move = self.choose_random_legal_action(battle)
+                action_index = self.legal_actions(battle)[0] if self.legal_actions(battle) else 0
+            else:
+                move = self.action_to_move(action_index, battle)
+        
+        # Store state and action for this turn (reward will be added next turn)
+        self.battle_history.append((state_vec.copy(), action_index, 0.0))
         
         # Track if this is a switch action
         self.last_action_was_switch = (action_index >= 4)
@@ -364,7 +502,7 @@ class MyRLAgent(Player):
         return move
     
     def on_battle_end(self, battle):
-        """Called when battle ends - compute terminal reward."""
+        """Called when battle ends - compute terminal reward and store experiences."""
         # Compute final turn reward if we have previous state
         if self.prev_battle_state is not None:
             turn_reward = self.reward_calc.compute_turn_reward(
@@ -373,10 +511,52 @@ class MyRLAgent(Player):
                 action_was_switch=self.last_action_was_switch
             )
             self.current_reward_score += turn_reward
+            
+            # Update last experience with final turn reward
+            if len(self.battle_history) > 0:
+                prev_state, prev_action, _ = self.battle_history[-1]
+                self.battle_history[-1] = (prev_state, prev_action, turn_reward)
         
         # Compute terminal reward
         terminal_reward = self.reward_calc.compute_terminal_reward(battle)
         self.current_reward_score += terminal_reward
+        
+        # Add terminal reward to last experience
+        if len(self.battle_history) > 0:
+            prev_state, prev_action, turn_reward = self.battle_history[-1]
+            self.battle_history[-1] = (prev_state, prev_action, turn_reward + terminal_reward)
+        
+        # Store complete episode (battle) for return computation
+        if len(self.battle_history) > 0:
+            self.episode_buffer.append(self.battle_history.copy())
+            # Process episodes and add to experience buffer
+            self._process_episodes()
+        
+        # Update training stats
+        self.training_stats['battles_completed'] += 1
+        if battle.won:
+            self.training_stats['wins'] += 1
+        elif battle.lost:
+            self.training_stats['losses'] += 1
+        else:
+            self.training_stats['draws'] += 1
+        self.training_stats['total_reward'] += self.current_reward_score
+        self.training_stats['avg_reward_per_battle'].append(self.current_reward_score)
+        
+        win_rate = self.training_stats['wins'] / self.training_stats['battles_completed']
+        self.training_stats['win_rate_history'].append(win_rate)
+        
+        # Decay epsilon
+        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+        
+        # Log progress periodically
+        if self.training_stats['battles_completed'] % 50 == 0:
+            print(f"Battles: {self.training_stats['battles_completed']}, "
+                  f"Win Rate: {win_rate:.2%}, Epsilon: {self.epsilon:.3f}")
+        
+        # Train on batch if we have enough experiences
+        if len(self.experience_buffer) >= self.batch_size:
+            self._train_batch()
         
         # Reset for next battle
         self.reward_calc.reset()
@@ -384,3 +564,147 @@ class MyRLAgent(Player):
         self.current_reward_score = 0.0
         self.last_action_was_switch = False
         self.battle_history = []
+    
+    def _process_episodes(self):
+        """Process episodes to compute discounted returns within each episode."""
+        # Process all episodes in buffer
+        while len(self.episode_buffer) > 0:
+            episode = self.episode_buffer.pop(0)
+            
+            # Compute returns within this episode (backwards)
+            returns = []
+            G = 0.0  # Return accumulator
+            
+            # Go backwards through episode to compute returns
+            for i in range(len(episode) - 1, -1, -1):
+                _, _, reward = episode[i]
+                G = reward + self.gamma * G  # Discounted return
+                returns.insert(0, G)
+            
+            # Add processed experiences to buffer
+            for (state, action, _), return_val in zip(episode, returns):
+                self.experience_buffer.append((state, action, return_val))
+    
+    def _train_batch(self):
+        """Train MLP on a batch of experiences using REINFORCE."""
+        if self.model is None or len(self.experience_buffer) < self.batch_size:
+            return
+        
+        # Sample batch (already has computed returns)
+        batch = self.experience_buffer[:self.batch_size]
+        self.experience_buffer = self.experience_buffer[self.batch_size:]
+        
+        # Extract states, actions, and returns
+        states = []
+        actions = []
+        returns = []
+        
+        for state, action, return_val in batch:
+            # Pad/truncate state to match model input size
+            state = np.array(state, dtype=np.float32)
+            current_size = len(state)
+            if current_size < self.state_size:
+                padded = np.zeros(self.state_size, dtype=np.float32)
+                padded[:current_size] = state
+                state = padded
+            elif current_size > self.state_size:
+                state = state[:self.state_size]
+            
+            states.append(state)
+            actions.append(action)
+            returns.append(return_val)
+        
+        # Convert to tensors
+        states_tensor = torch.FloatTensor(np.array(states))
+        actions_tensor = torch.LongTensor(actions)
+        returns_tensor = torch.FloatTensor(returns)
+        
+        # Normalize returns (baseline subtraction)
+        returns_tensor = (returns_tensor - returns_tensor.mean()) / (returns_tensor.std() + 1e-8)
+        
+        # Forward pass
+        self.model.train()
+        self.optimizer.zero_grad()
+        logits = self.model(states_tensor)
+        probs = torch.softmax(logits, dim=1)
+        
+        # REINFORCE loss: -log(prob(action)) * return
+        log_probs = torch.log(probs + 1e-8)
+        selected_log_probs = log_probs.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
+        loss = -(selected_log_probs * returns_tensor).mean()
+        
+        # Backward pass
+        loss.backward()
+        self.optimizer.step()
+        
+        self.model.eval()
+    
+    def save_results(self, filename="training_results.json"):
+        """Save training statistics to JSON file."""
+        if self.training_stats['battles_completed'] == 0:
+            print("Warning: No battles completed. Results file will contain zeros.")
+        
+        results = {
+            'total_battles': self.training_stats['battles_completed'],
+            'wins': self.training_stats['wins'],
+            'losses': self.training_stats['losses'],
+            'draws': self.training_stats['draws'],
+            'win_rate': self.training_stats['wins'] / max(self.training_stats['battles_completed'], 1),
+            'total_reward': self.training_stats['total_reward'],
+            'avg_reward_per_battle': np.mean(self.training_stats['avg_reward_per_battle']) if self.training_stats['avg_reward_per_battle'] else 0.0,
+            'win_rate_history': self.training_stats['win_rate_history'],
+            'rewards_per_battle': self.training_stats['avg_reward_per_battle']
+        }
+        
+        with open(filename, 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        print(f"Results saved to {filename}")
+        if self.training_stats['battles_completed'] > 0:
+            print(f"  Completed: {self.training_stats['battles_completed']} battles")
+            print(f"  Win rate: {results['win_rate']:.2%}")
+    
+    def save_model(self, filename="mlp_model.pth"):
+        """Save the trained model."""
+        if self.model is None:
+            print("Warning: Model not initialized. Cannot save.")
+            return
+        
+        # Ensure models directory exists
+        models_dir = "models"
+        if not os.path.exists(models_dir):
+            os.makedirs(models_dir, exist_ok=True)
+            print(f"Created models directory: {models_dir}")
+        
+        # Save to models folder
+        filepath = os.path.join(models_dir, filename)
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'state_size': self.state_size,
+            'action_size': self.action_size,
+            'epsilon': self.epsilon,
+            'training_stats': self.training_stats,
+        }, filepath)
+        print(f"Model saved to {filepath}")
+    
+    def load_model(self, filename="mlp_model.pth"):
+        """Load a trained model."""
+        # Load from models folder
+        filepath = os.path.join("models", filename)
+        if not os.path.exists(filepath):
+            print(f"Model file not found: {filepath}")
+            return False
+        
+        checkpoint = torch.load(filepath)
+        self.state_size = checkpoint['state_size']
+        self.action_size = checkpoint['action_size']
+        self._init_model(self.state_size, silent=True)  # Silent when loading existing model
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'epsilon' in checkpoint:
+            self.epsilon = checkpoint['epsilon']
+        if 'training_stats' in checkpoint:
+            self.training_stats = checkpoint['training_stats']
+        print(f"Model loaded from {filepath}")
+        return True

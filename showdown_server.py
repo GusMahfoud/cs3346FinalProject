@@ -4,10 +4,57 @@ import os
 import time
 import shutil
 import urllib.request
+import re
 
 # Location of Showdown data
 SHOWDOWN_DIR = os.path.join(os.getcwd(), "pokemon-showdown")
 SHOWDOWN_URL = "http://localhost:8000"
+
+
+def kill_process_on_port(port=8000):
+    """Kill any process using the specified port on Windows."""
+    try:
+        # Find process using the port
+        result = subprocess.run(
+            f'netstat -ano | findstr :{port}',
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+        
+        if result.stdout:
+            # Extract PIDs from netstat output
+            pids = set()
+            for line in result.stdout.strip().split('\n'):
+                if line.strip():
+                    # netstat format: TCP    0.0.0.0:8000    0.0.0.0:0    LISTENING    12345
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        pid = parts[-1]
+                        if pid.isdigit():
+                            pids.add(pid)
+            
+            # Kill each process
+            for pid in pids:
+                try:
+                    print(f"Killing process {pid} on port {port}...")
+                    subprocess.run(
+                        f'taskkill /F /PID {pid}',
+                        shell=True,
+                        capture_output=True,
+                        check=False
+                    )
+                    time.sleep(0.5)  # Give it time to release the port
+                except Exception as e:
+                    print(f"Warning: Could not kill process {pid}: {e}")
+            
+            if pids:
+                print(f"Freed port {port}")
+                return True
+    except Exception as e:
+        print(f"Warning: Could not check port {port}: {e}")
+    
+    return False
 
 
 def ensure_showdown_checkout():
@@ -23,7 +70,8 @@ def ensure_showdown_checkout():
     node_modules = os.path.join(SHOWDOWN_DIR, "node_modules")
     if not os.path.exists(node_modules):
         print("Running npm install...")
-        subprocess.run(["npm", "install"], cwd=SHOWDOWN_DIR, check=True)
+        # Use shell=True on Windows to resolve .cmd extensions
+        subprocess.run("npm install", cwd=SHOWDOWN_DIR, check=True, shell=True)
 
     # Ensure config.js exists
     config_dir = os.path.join(SHOWDOWN_DIR, "config")
@@ -76,6 +124,9 @@ def wait_for_server(timeout=20.0, poll_interval=0.5):
 
 def start_showdown_server():
     """Start local Showdown server and wait for readiness."""
+    # Check and kill any process on port 8000
+    kill_process_on_port(8000)
+    
     ensure_showdown_checkout()
 
     # Ensure logs/repl directory exists (Showdown requires it)
@@ -86,11 +137,13 @@ def start_showdown_server():
     # Run from the PARENT directory of pokemon-showdown
     parent_dir = os.path.dirname(SHOWDOWN_DIR)
 
+    # Use shell=True on Windows to resolve .cmd extensions
     proc = subprocess.Popen(
-        ["node", "pokemon-showdown", "start", "--no-security"],
+        "node pokemon-showdown start --no-security",
         cwd=SHOWDOWN_DIR,
         stdout=None,
         stderr=None,
+        shell=True,
     )
 
 
