@@ -12,40 +12,72 @@ def format_evs(evs):
     return " / ".join(parts)
 
 def format_ivs(ivs):
-    parts = []
-    parts.append(f'{ivs["hp"]} HP')
-    parts.append(f'{ivs["atk"]} Atk')
-    parts.append(f'{ivs["def"]} Def')
-    parts.append(f'{ivs["spa"]} SpA')
-    parts.append(f'{ivs["spd"]} SpD')
-    parts.append(f'{ivs["spe"]} Spe')
-    return " / ".join(parts)
+    return (
+        f'{ivs["hp"]} HP / {ivs["atk"]} Atk / {ivs["def"]} Def / '
+        f'{ivs["spa"]} SpA / {ivs["spd"]} SpD / {ivs["spe"]} Spe'
+    )
 
 def mon_to_showdown(mon):
-    s = []
-    s.append(f'{mon["species"]} @ {mon["item"]}')
-    s.append(f'Ability: {mon["ability"]}')
-    s.append(f'{mon["nature"]} Nature')
+    lines = []
+    lines.append(f'{mon["species"]}')
+    lines.append(f'Ability: {mon["ability"]}')
+    lines.append(f'{mon["nature"]} Nature')
 
-    # EVs
     ev_line = format_evs(mon["evs"])
     if ev_line:
-        s.append(f'EVs: {ev_line}')
+        lines.append(f'EVs: {ev_line}')
 
-    # IVs always included
-    iv_line = format_ivs(mon["ivs"])
-    s.append(f'IVs: {iv_line}')
+    lines.append(f'IVs: {format_ivs(mon["ivs"])}')
 
-    # Moves
     for m in mon["moves"]:
-        s.append(f'- {m}')
+        lines.append(f'- {m}')
 
-    return "\n".join(s)
+    return "\n".join(lines)
 
 def load_pool(json_path="teams/team_pool.json"):
     with open(json_path, "r") as f:
         return json.load(f)
 
-def generate_team_from_pool(pool, size=6):
-    mons = random.sample(pool, size)
-    return "\n\n".join(mon_to_showdown(mon) for mon in mons)
+
+# ============================================================
+#  FUNCTION 1 — RANDOM LEAD
+# ============================================================
+
+def generate_random_lead_team(pool):
+    """
+    Always uses the same 6 Pokémon from the pool,
+    but randomly shuffles which one appears first.
+    Remaining 5 are kept in original pool order.
+    """
+    if len(pool) < 6:
+        raise ValueError("Team pool must contain at least 6 Pokémon.")
+
+    # fixed team list (first 6 entries exactly)
+    fixed_team = list(pool[:6])
+
+    # pick one to be the lead
+    lead_index = random.randint(0, 5)
+
+    # reorder: chosen lead first, rest in original order
+    reordered = [fixed_team[lead_index]] + [
+        fixed_team[i] for i in range(6) if i != lead_index
+    ]
+
+    return "\n\n".join(mon_to_showdown(mon) for mon in reordered)
+
+
+# ============================================================
+#  FUNCTION 2 — FIXED TEAM (NO RANDOMIZATION)
+# ============================================================
+
+def generate_fixed_team(pool):
+    """
+    Returns the SAME team order every time.
+    No randomization, fully deterministic.
+    """
+    if len(pool) < 6:
+        raise ValueError("Team pool must contain at least 6 Pokémon.")
+
+    team = pool[:6]  # unchanged order
+
+    return "\n\n".join(mon_to_showdown(mon) for mon in team)

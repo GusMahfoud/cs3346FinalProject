@@ -1,180 +1,48 @@
 [
   {
     "species": "Dragapult",
-    "item": "Choice Specs",
     "ability": "Infiltrator",
-    "nature": "Timid",
+    "nature": "Hardy",
     "evs": {"hp": 0, "atk": 0, "def": 0, "spa": 252, "spd": 4, "spe": 252},
     "ivs": {"hp": 31, "atk": 0, "def": 31, "spa": 31, "spd": 31, "spe": 31},
     "moves": ["Draco Meteor", "Shadow Ball", "Flamethrower", "U-turn"]
   },
   {
     "species": "Gholdengo",
-    "item": "Air Balloon",
     "ability": "Good as Gold",
-    "nature": "Timid",
+    "nature": "Hardy",
     "evs": {"hp": 0, "atk": 0, "def": 0, "spa": 252, "spd": 4, "spe": 252},
     "ivs": {"hp": 31, "atk": 0, "def": 31, "spa": 31, "spd": 31, "spe": 31},
     "moves": ["Make It Rain", "Shadow Ball", "Recover", "Nasty Plot"]
   },
   {
     "species": "Kingambit",
-    "item": "Black Glasses",
     "ability": "Supreme Overlord",
-    "nature": "Adamant",
+    "nature": "Hardy",
     "evs": {"hp": 252, "atk": 0, "def": 0, "spa": 0, "spd": 252, "spe": 4},
     "ivs": {"hp": 31, "atk": 31, "def": 31, "spa": 31, "spd": 31, "spe": 31},
     "moves": ["Kowtow Cleave", "Sucker Punch", "Swords Dance", "Iron Head"]
   },
   {
-    "species": "Great Tusk",
-    "item": "Leftovers",
-    "ability": "Protosynthesis",
-    "nature": "Impish",
-    "evs": {"hp": 252, "atk": 4, "def": 252, "spa": 0, "spd": 0, "spe": 0},
-    "ivs": {"hp": 31, "atk": 31, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Rapid Spin", "Stealth Rock", "Earthquake", "Knock Off"]
-  },
-  {
     "species": "Iron Valiant",
-    "item": "Booster Energy",
     "ability": "Quark Drive",
-    "nature": "Timid",
+    "nature": "Hardy",
     "evs": {"hp": 0, "atk": 0, "def": 0, "spa": 252, "spd": 4, "spe": 252},
     "ivs": {"hp": 31, "atk": 0, "def": 31, "spa": 31, "spd": 31, "spe": 31},
     "moves": ["Moonblast", "Thunderbolt", "Aura Sphere", "Calm Mind"]
   },
   {
-    "species": "Rillaboom",
-    "item": "Choice Band",
-    "ability": "Grassy Surge",
-    "nature": "Adamant",
-    "evs": {"hp": 0, "atk": 252, "def": 0, "spa": 0, "spd": 4, "spe": 252},
-    "ivs": {"hp": 31, "atk": 31, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Grassy Glide", "Wood Hammer", "U-turn", "Knock Off"]
-  },
-  {
-    "species": "Ting-Lu",
-    "item": "Leftovers",
-    "ability": "Vessel of Ruin",
-    "nature": "Careful",
-    "evs": {"hp": 252, "atk": 0, "def": 4, "spa": 0, "spd": 252, "spe": 0},
-    "ivs": {"hp": 31, "atk": 31, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Spikes", "Ruination", "Earthquake", "Whirlwind"]
-  },
-  {
-    "species": "Heatran",
-    "item": "Leftovers",
-    "ability": "Flash Fire",
-    "nature": "Calm",
-    "evs": {"hp": 248, "atk": 0, "def": 8, "spa": 0, "spd": 252, "spe": 0},
-    "ivs": {"hp": 31, "atk": 0, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Magma Storm", "Earth Power", "Stealth Rock", "Taunt"]
-  },
-  {
-    "species": "Cinderace",
-    "item": "Heavy-Duty Boots",
-    "ability": "Libero",
-    "nature": "Jolly",
-    "evs": {"hp": 0, "atk": 252, "def": 0, "spa": 0, "spd": 4, "spe": 252},
-    "ivs": {"hp": 31, "atk": 31, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Pyro Ball", "U-turn", "Court Change", "High Jump Kick"]
-  },
-  {
-    "species": "Landorus-Therian",
-    "item": "Rocky Helmet",
-    "ability": "Intimidate",
-    "nature": "Impish",
-    "evs": {"hp": 252, "atk": 4, "def": 252, "spa": 0, "spd": 0, "spe": 0},
-    "ivs": {"hp": 31, "atk": 31, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Earthquake", "U-turn", "Stealth Rock", "Stone Edge"]
-  },
-  {
-    "species": "Rotom-Wash",
-    "item": "Leftovers",
-    "ability": "Levitate",
-    "nature": "Bold",
-    "evs": {"hp": 248, "atk": 0, "def": 252, "spa": 0, "spd": 8, "spe": 0},
-    "ivs": {"hp": 31, "atk": 0, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Volt Switch", "Hydro Pump", "Will-O-Wisp", "Pain Split"]
-  },
-  {
-    "species": "Slowking-Galar",
-    "item": "Heavy-Duty Boots",
-    "ability": "Regenerator",
-    "nature": "Calm",
-    "evs": {"hp": 248, "atk": 0, "def": 0, "spa": 8, "spd": 252, "spe": 0},
-    "ivs": {"hp": 31, "atk": 0, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Future Sight", "Sludge Bomb", "Chilly Reception", "Slack Off"]
-  },
-  {
-    "species": "Garchomp",
-    "item": "Rocky Helmet",
-    "ability": "Rough Skin",
-    "nature": "Impish",
-    "evs": {"hp": 252, "atk": 4, "def": 252, "spa": 0, "spd": 0, "spe": 0},
-    "ivs": {"hp": 31, "atk": 31, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Earthquake", "Dragon Tail", "Stealth Rock", "Spikes"]
-  },
-  {
     "species": "Weavile",
-    "item": "Heavy-Duty Boots",
     "ability": "Pressure",
-    "nature": "Jolly",
+    "nature": "Hardy",
     "evs": {"hp": 0, "atk": 252, "def": 0, "spa": 0, "spd": 4, "spe": 252},
     "ivs": {"hp": 31, "atk": 31, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Triple Axel", "Knock Off", "Ice Shard", "Swords Dance"]
-  },
-  {
-    "species": "Iron Moth",
-    "item": "Booster Energy",
-    "ability": "Quark Drive",
-    "nature": "Timid",
-    "evs": {"hp": 0, "atk": 0, "def": 0, "spa": 252, "spd": 4, "spe": 252},
-    "ivs": {"hp": 31, "atk": 0, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Fiery Dance", "Sludge Wave", "Energy Ball", "U-turn"]
-  },
-  {
-    "species": "Azumarill",
-    "item": "Sitrus Berry",
-    "ability": "Huge Power",
-    "nature": "Adamant",
-    "evs": {"hp": 92, "atk": 252, "def": 0, "spa": 0, "spd": 164, "spe": 0},
-    "ivs": {"hp": 31, "atk": 31, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Belly Drum", "Aqua Jet", "Play Rough", "Knock Off"]
-  },
-  {
-    "species": "Iron Hands",
-    "item": "Assault Vest",
-    "ability": "Quark Drive",
-    "nature": "Adamant",
-    "evs": {"hp": 132, "atk": 252, "def": 0, "spa": 0, "spd": 124, "spe": 0},
-    "ivs": {"hp": 31, "atk": 31, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Drain Punch", "Ice Punch", "Volt Switch", "Heavy Slam"]
-  },
-  {
-    "species": "Enamorus",
-    "item": "Choice Scarf",
-    "ability": "Contrary",
-    "nature": "Timid",
-    "evs": {"hp": 0, "atk": 0, "def": 0, "spa": 252, "spd": 4, "spe": 252},
-    "ivs": {"hp": 31, "atk": 0, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Moonblast", "Earth Power", "Mystical Fire", "Tera Blast"]
-  },
-  {
-    "species": "Volcarona",
-    "item": "Heavy-Duty Boots",
-    "ability": "Flame Body",
-    "nature": "Timid",
-    "evs": {"hp": 0, "atk": 0, "def": 0, "spa": 252, "spd": 4, "spe": 252},
-    "ivs": {"hp": 31, "atk": 0, "def": 31, "spa": 31, "spd": 31, "spe": 31},
-    "moves": ["Fiery Dance", "Bug Buzz", "Giga Drain", "Quiver Dance"]
+    "moves": ["Poison Jab", "Night Slash", "Ice Shard", "Swords Dance"]
   },
   {
     "species": "Skeledirge",
-    "item": "Heavy-Duty Boots",
     "ability": "Unaware",
-    "nature": "Bold",
+    "nature": "Hardy",
     "evs": {"hp": 252, "atk": 0, "def": 252, "spa": 4, "spd": 0, "spe": 0},
     "ivs": {"hp": 31, "atk": 0, "def": 31, "spa": 31, "spd": 31, "spe": 31},
     "moves": ["Torch Song", "Shadow Ball", "Slack Off", "Will-O-Wisp"]

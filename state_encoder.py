@@ -2,340 +2,290 @@
 import numpy as np
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.move import Move
-from poke_env.battle.side_condition import SideCondition
-from poke_env.battle.weather import Weather
-from poke_env.battle.field import Field
 
-from team_pool_loader import build_species_stats
-
-# Precomputed stats from team_pool.json (open team sheets)
-SPECIES_STATS = build_species_stats()
+from team_pool_loader import SPECIES_STATS    # precomputed stats (hp, atk, def, spa, spd, spe)
 
 
-def _normalize_species(name: str) -> str:
+# ============================================================
+# FIXED POKEMON ORDER (must match your pool)
+# ============================================================
+POKEMON_ORDER = [
+    "dragapult",
+    "gholdengo",
+    "kingambit",
+    "ironvaliant",
+    "weavile",
+    "skeledirge",
+]
+SPECIES_INDEX = {name: i for i, name in enumerate(POKEMON_ORDER)}
+
+
+# ------------------------------------------------------------
+# Utility Normalizer
+# ------------------------------------------------------------
+def _norm(name: str) -> str:
     return name.lower().replace(" ", "").replace("-", "")
 
 
-# ==============================================================================
-#                               BUCKET HELPERS
-# ==============================================================================
+# ============================================================
+# TRUE STATS LOOKUP (SAFE)
+# ============================================================
+def get_true_stats(pokemon):
+    """
+    Returns full stats from SPECIES_STATS (hp, atk, def, spa, spd, spe).
+    Works for both ally + opponent Pokémon.
+    Never depends on EVs/IVs/nature sent by Showdown.
+    """
 
-def bucket(val, thresholds):
-    for i, t in enumerate(thresholds):
-        if val < t:
-            return float(i) / len(thresholds)
-    return 1.0
+    if pokemon is None or pokemon.species is None:
+        return {"hp": 0, "atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0}
 
+    sid = _norm(pokemon.species)
 
-def hp_bucket(p: Pokemon):
-    if not p or not p.max_hp:
-        return 0.0
-    return bucket((p.current_hp or 0) / p.max_hp, [0.25, 0.5, 0.75])
-
-
-def stat_bucket(value):
-    return bucket(value, [120, 200, 300, 400])
-
-
-def power_bucket(bp):
-    return bucket(bp, [40, 70, 100, 150])
+    return SPECIES_STATS.get(
+        sid,
+        {"hp": 0, "atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0},
+    )
 
 
-# ==============================================================================
-#                     ROLE & MOVE CATEGORY IDENTIFICATION
-# ==============================================================================
-
-SETUP = {"swordsdance", "nastyplot", "quiverdance", "calmmind", "bellydrum"}
-PIVOT = {"uturn", "voltswitch", "flipturn"}
-HAZARD = {"stealthrock", "spikes"}
-HAZARD_REMOVE = {"rapidspin", "defog", "courtchange"}
-RECOVERY = {"recover", "slackoff", "painsplit", "roost"}
-PHASING = {"whirlwind", "dragontail"}
-
-
-def move_flags(m: Move):
-    if not m:
-        return [0, 0, 0, 0, 0, 0]
-    mid = m.id
-    return [
-        int(mid in SETUP),
-        int(mid in HAZARD),
-        int(mid in HAZARD_REMOVE),
-        int(mid in PIVOT),
-        int(mid in RECOVERY),
-        int(mid in PHASING),
-    ]
-
-
-def role_flags(stats):
-    if not stats:
-        return [0, 0, 0, 0, 0]
-    return [
-        int(stats["atk"] > stats["spa"]),   # physical lean
-        int(stats["spa"] > stats["atk"]),   # special lean
-        int(stats["def"] > 150),            # physical wall
-        int(stats["spd"] > 150),            # special wall
-        int(stats["spe"] > 120),            # fast
-    ]
-
-
-# ==============================================================================
-#                DAMAGE ESTIMATION (FOR MATCHUP / BENCH VALUE)
-# ==============================================================================
-
-def simple_threat(attacker: Pokemon, defender: Pokemon):
-    """Rough one-shot danger estimate using runtime move + type info."""
-    if not attacker or not defender:
+# ============================================================
+# HP + SPEED BUCKETS
+# ============================================================
+def hp_bucket(p: Pokemon) -> float:
+    if p is None or not p.max_hp:
         return 0.0
 
+    frac = (p.current_hp or 0) / p.max_hp
+
+    if frac <= 0.25: b = 0
+    elif frac <= 0.50: b = 1
+    elif frac <= 0.75: b = 2
+    else: b = 3
+
+    return b / 3.0
+
+
+def speed_bucket(raw_speed: int) -> float:
+    if raw_speed < 60: b = 0
+    elif raw_speed < 100: b = 1
+    elif raw_speed < 130: b = 2
+    else: b = 3
+    return b / 3.0
+
+
+# ============================================================
+# MOVESET CATEGORIES
+# ============================================================
+SETUP_MOVES = {
+    "swordsdance", "nastyplot", "quiverdance", "calmmind",
+    "bellydrum", "torchsong"
+}
+
+PRIORITY_MOVES = {
+    "iceshard", "suckerpunch", "shadowsneak"
+}
+
+
+# ============================================================
+# MOVESET SUMMARY
+# ============================================================
+def summarize_moves(mon: Pokemon, opp: Pokemon):
+    """
+    Returns:
+      has_priority, has_setup, best_damage_ratio, has_SE
+    """
+
+    if mon is None or mon.moves is None:
+        return [0, 0, 0.0, 0]
+
+    has_prio = 0
+    has_setup = 0
+    has_se = 0
     best = 0.0
-    for m in attacker.moves.values():
-        if not m or not m.base_power:
+
+    opp_types = (opp.type_1, opp.type_2) if opp else (None, None)
+    opp_hp = opp.max_hp if opp else 1
+
+    for mv in mon.moves.values():
+        if mv is None:
             continue
 
-        # Type effectiveness via Showdown's type system
-        try:
-            mult = m.type.damage_multiplier(defender.type_1, defender.type_2)
-        except Exception:
+        mid = mv.id
+
+        if mid in PRIORITY_MOVES:
+            has_prio = 1
+
+        if mid in SETUP_MOVES:
+            has_setup = 1
+
+        # damage approx if base_power exists
+        if mv.base_power:
             mult = 1.0
-
-        dmg = m.base_power * mult
-
-        # STAB
-        try:
-            if m.type in {attacker.type_1, attacker.type_2}:
-                dmg *= 1.5
-        except Exception:
-            pass
-
-        if defender.max_hp:
-            best = max(best, dmg / defender.max_hp)
-
-    # bucket threat level
-    return bucket(best, [0.25, 0.5, 0.75, 1.0])
-
-
-# ==============================================================================
-#                  ENCODE INDIVIDUAL POKEMON (ACTIVE OR BENCH)
-# ==============================================================================
-
-def encode_one_pokemon(p: Pokemon, opp_active: Pokemon):
-    """
-    Encode a Pokémon using precomputed species stats when available,
-    falling back to Showdown's own stats. This avoids None-type issues.
-    """
-    if p is None:
-        return [0.0] * 25  # fixed length fallback
-
-    species = _normalize_species(p.species)
-
-    # 1. Get stable stats
-    if species in SPECIES_STATS:
-        full_stats = SPECIES_STATS[species]
-    else:
-        # fall back to battle.stats if available, else zeros
-        base_stats = p.stats or {}
-        full_stats = {
-            "atk": base_stats.get("atk", 0) or 0,
-            "def": base_stats.get("def", 0) or 0,
-            "spa": base_stats.get("spa", 0) or 0,
-            "spd": base_stats.get("spd", 0) or 0,
-            "spe": base_stats.get("spe", 0) or 0,
-            "hp": (p.max_hp or 1),
-        }
-
-    # HP bucket from current battle state
-    vec = [hp_bucket(p)]
-
-    # 2. Stat buckets (using full_stats)
-    vec.extend([
-        stat_bucket(full_stats["atk"]),
-        stat_bucket(full_stats["spa"]),
-        stat_bucket(full_stats["def"]),
-        stat_bucket(full_stats["spd"]),
-        stat_bucket(full_stats["spe"]),
-    ])
-
-    # 3. Role flags
-    vec.extend(role_flags(full_stats))
-
-    # 4. Speed comparison
-    try:
-        opp_species = _normalize_species(opp_active.species)
-        if opp_species in SPECIES_STATS:
-            opp_stats = SPECIES_STATS[opp_species]
-        else:
-            opp_stats = opp_active.stats or {}
-        faster = int(full_stats["spe"] > opp_stats.get("spe", 0))
-    except Exception:
-        faster = 0
-    vec.append(faster)
-
-    # 5. Matchup flags based on move types and typings
-    has_SE = False
-    opp_SE = False
-
-    try:
-        opp_t1, opp_t2 = opp_active.type_1, opp_active.type_2
-    except Exception:
-        opp_t1, opp_t2 = None, None
-
-    # p → opp
-    for m in p.moves.values():
-        try:
-            if m and m.type.damage_multiplier(opp_t1, opp_t2) > 1:
-                has_SE = True
-                break
-        except Exception:
-            pass
-
-    # opp → p
-    try:
-        my_t1, my_t2 = p.type_1, p.type_2
-    except Exception:
-        my_t1, my_t2 = None, None
-
-    if opp_active is not None:
-        for m in opp_active.moves.values():
             try:
-                if m and m.type.damage_multiplier(my_t1, my_t2) > 1:
-                    opp_SE = True
-                    break
-            except Exception:
+                mult = mv.type.damage_multiplier(*opp_types)
+            except:
                 pass
 
-    vec.extend([int(has_SE), int(opp_SE)])
+            dmg = mv.base_power * mult
 
-    # 6. One-shot threat (both directions) using runtime info
-    vec.append(simple_threat(p, opp_active))
-    vec.append(simple_threat(opp_active, p))
+            # STAB
+            try:
+                if mv.type in {mon.type_1, mon.type_2}:
+                    dmg *= 1.5
+            except:
+                pass
 
-    # 7. Aggregate move-category flags from this mon's moves
-    flags = [0] * 6
-    for m in p.moves.values():
-        mf = move_flags(m)
-        flags = [max(a, b) for a, b in zip(flags, mf)]
+            best = max(best, min(dmg / max(opp_hp, 1), 1.0))
 
-    vec.extend(flags)
+            if mult > 1.0:
+                has_se = 1
 
-    # This vector length is 22; for bench we pad to 25.
+    return [has_prio, has_setup, best, has_se]
+
+
+# ============================================================
+# ACTIVE PAIR ENCODING
+# ============================================================
+def encode_active_pair(my: Pokemon, opp: Pokemon):
+    """
+    Encodes:
+      my_hp_bucket
+      opp_hp_bucket
+      my_speed_bucket
+      opp_speed_bucket
+      faster_flag
+      my_moves_summary (4)
+      opp_moves_summary (4)
+      my_atk_boost
+      my_spa_boost
+      opp_atk_boost
+      opp_spa_boost
+    """
+
+    my_stats = get_true_stats(my)
+    opp_stats = get_true_stats(opp)
+
+    my_speed = my_stats["spe"]
+    opp_speed = opp_stats["spe"]
+
+    faster = 1 if my_speed > opp_speed else 0
+
+    vec = [
+        hp_bucket(my),
+        hp_bucket(opp),
+        speed_bucket(my_speed),
+        speed_bucket(opp_speed),
+        faster,
+    ]
+
+    # moveset summaries
+    vec.extend(summarize_moves(my, opp))
+    vec.extend(summarize_moves(opp, my))
+
+    # boosts
+    def boost(mon, k):
+        if mon is None:
+            return 0.0
+        stage = mon.boosts.get(k, 0)
+        return (max(-6, min(6, stage)) + 6) / 12.0
+
+    vec.append(boost(my, "atk"))
+    vec.append(boost(my, "spa"))
+    vec.append(boost(opp, "atk"))
+    vec.append(boost(opp, "spa"))
+
     return vec
 
 
-# ==============================================================================
-#                  ENCODE THE ENTIRE BENCH (5 MONS)
-# ==============================================================================
+# ============================================================
+# BENCH ENCODING
+# ============================================================
+def sorted_bench(team, active):
+    mons = [p for p in team.values() if p is not active]
 
-def encode_bench(battle):
-    my_active = battle.active_pokemon
-    bench_vec = []
+    def key_fn(p):
+        if p is None:
+            return 999
+        return SPECIES_INDEX.get(_norm(p.species), 999)
 
-    # non-active mons on our side
-    bench = [p for p in battle.team.values() if p is not my_active]
-
-    # deterministic order
-    bench = sorted(bench, key=lambda p: p.species if p else "")
-
-    for p in bench:
-        bench_vec.extend(encode_one_pokemon(p, battle.opponent_active_pokemon))
-
-    BENCH_SIZE = 5
-    ENTRY_LEN = 25  # we pad each slot to 25 for fixed length
-    while len(bench_vec) < BENCH_SIZE * ENTRY_LEN:
-        bench_vec.extend([0.0] * ENTRY_LEN)
-
-    return bench_vec
+    return sorted(mons, key=key_fn)
 
 
-# ==============================================================================
-#                           WEATHER / TERRAIN
-# ==============================================================================
+def encode_bench(team, active, opp):
+    """
+    For each bench mon:
+      hp_bucket
+      speed_bucket
+      faster_than_opp
+      moves_summary (4)
+    Total = 7 features per mon, padded to 5 mons => 35 dims.
+    """
 
-def encode_weather_and_terrain(battle):
-    wvec = [0, 0, 0, 0]
-    tvec = [0, 0, 0, 0]
-
-    # Weather
-    if battle.weather:
-        try:
-            w = battle.weather[0] if isinstance(battle.weather, tuple) else battle.weather
-            if w == Weather.SUNNYDAY:
-                wvec[0] = 1
-            elif w == Weather.RAINDANCE:
-                wvec[1] = 1
-            elif w == Weather.SANDSTORM:
-                wvec[2] = 1
-            elif w == Weather.HAIL:
-                wvec[3] = 1
-        except Exception:
-            pass
-
-    # Terrain
-    for f in battle.fields:
-        if f == Field.GRASSY_TERRAIN:
-            tvec[0] = 1
-        elif f == Field.ELECTRIC_TERRAIN:
-            tvec[1] = 1
-        elif f == Field.MISTY_TERRAIN:
-            tvec[2] = 1
-        elif f == Field.PSYCHIC_TERRAIN:
-            tvec[3] = 1
-
-    return wvec + tvec
-
-
-# ==============================================================================
-#                            HAZARDS + TEAM HP
-# ==============================================================================
-
-def avg_team_hp(team):
-    total = 0
-    maxhp = 0
-    for p in team.values():
-        if p and p.max_hp:
-            maxhp += p.max_hp
-            total += p.current_hp or 0
-    return (total / maxhp) if maxhp else 0.0
-
-
-# ==============================================================================
-#                            FULL STATE ENCODER
-# ==============================================================================
-
-def encode_state(battle):
     vec = []
+    opp_stats = get_true_stats(opp)
+    opp_speed = opp_stats["spe"]
 
+    for p in sorted_bench(team, active):
+        ps = get_true_stats(p)
+        pspeed = ps["spe"]
+
+        vec.extend([
+            hp_bucket(p),
+            speed_bucket(pspeed),
+            1 if pspeed > opp_speed else 0,
+        ])
+
+        vec.extend(summarize_moves(p, opp))
+
+    while len(vec) < 35:
+        vec.extend([0] * 7)
+
+    return vec
+
+
+# ============================================================
+# ALIVE ENCODING
+# ============================================================
+def encode_alive(battle):
+    my_flags = [0] * len(POKEMON_ORDER)
+    opp_flags = [0] * len(POKEMON_ORDER)
+
+    for p in battle.team.values():
+        idx = SPECIES_INDEX.get(_norm(p.species))
+        if idx is not None:
+            my_flags[idx] = 0 if p.fainted else 1
+
+    for p in battle.opponent_team.values():
+        idx = SPECIES_INDEX.get(_norm(p.species))
+        if idx is not None:
+            opp_flags[idx] = 0 if p.fainted else 1
+
+    return my_flags + opp_flags
+
+
+# ============================================================
+# TURN BUCKET
+# ============================================================
+def turn_bucket(turn: int):
+    if turn < 5: t = 0
+    elif turn < 10: t = 1
+    elif turn < 20: t = 2
+    else: t = 3
+    return t / 3.0
+
+
+# ============================================================
+# MAIN ENCODER
+# ============================================================
+def encode_state(battle):
     my = battle.active_pokemon
     opp = battle.opponent_active_pokemon
 
-    # ACTIVE MONS
-    vec.extend(encode_one_pokemon(my, opp))
-    vec.extend(encode_one_pokemon(opp, my))
-
-    # BENCH
-    vec.extend(encode_bench(battle))
-
-    # GLOBALS
-    vec.extend(encode_weather_and_terrain(battle))
-
-    # Hazards (SR + Spikes layers)
-    vec.extend([
-        int(SideCondition.STEALTH_ROCK in battle.side_conditions),
-        battle.side_conditions.get(SideCondition.SPIKES, 0) / 3.0,
-        int(SideCondition.STEALTH_ROCK in battle.opponent_side_conditions),
-        battle.opponent_side_conditions.get(SideCondition.SPIKES, 0) / 3.0,
-    ])
-
-    # Team-level resources
-    vec.append(avg_team_hp(battle.team))
-    vec.append(avg_team_hp(battle.opponent_team))
-
-    # Pokémon remaining alive
-    my_alive = sum(1 for p in battle.team.values() if not p.fainted)
-    opp_alive = sum(1 for p in battle.opponent_team.values() if not p.fainted)
-    vec.extend([my_alive / 6.0, opp_alive / 6.0])
-
-    # Turn bucket
-    vec.append(bucket(battle.turn, [5, 10, 20, 30]))
+    vec = []
+    vec.extend(encode_active_pair(my, opp))
+    vec.extend(encode_bench(battle.team, my, opp))
+    vec.extend(encode_bench(battle.opponent_team, opp, my))
+    vec.extend(encode_alive(battle))
+    vec.append(turn_bucket(battle.turn))
 
     return np.array(vec, dtype=np.float32)

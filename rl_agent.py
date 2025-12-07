@@ -1,524 +1,482 @@
 from poke_env.player.player import Player
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import json
 import os
+from torch.utils.tensorboard import SummaryWriter
 
 from rewards import RewardCalculator
 from state_encoder import encode_state
 
+# ============================================================
+# ACTION SPACE CONSTANTS
+# ============================================================
 
-# -----------------------------
-# ACTOR-CRITIC NETWORK
-# -----------------------------
+# Move slots 0–3
+MOVE_ACTIONS = [0, 1, 2, 3]
+
+# Switch slots start here (up to 6 teammates → 4–9)
+SWITCH_OFFSET = 4
+
+# Pivot moves that cause switching on hit
+PIVOT_MOVES = {"uturn", "voltturn", "flipturn", "partingshot"}
+
+
+# ============================================================
+# ACTOR–CRITIC NETWORK
+# ============================================================
 
 class ActorCriticNet(nn.Module):
-    """
-    Shared trunk with:
-      - Policy head: logits over actions
-      - Value head: scalar V(s)
-    """
     def __init__(self, state_size, action_size=10, hidden_size=512):
         super().__init__()
         self.fc1 = nn.Linear(state_size, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.policy_head = nn.Linear(hidden_size, action_size)
-        self.value_head = nn.Linear(hidden_size, 1)
+        self.policy = nn.Linear(hidden_size, action_size)
+        self.value = nn.Linear(hidden_size, 1)
         self.relu = nn.ReLU()
 
-    def forward(self, state):
-        """
-        state: (B, state_size)
-        returns:
-          logits: (B, action_size)
-          values: (B,)  value estimates
-        """
-        x = self.relu(self.fc1(state))
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
-        logits = self.policy_head(x)
-        values = self.value_head(x).squeeze(-1)
-        return logits, values
+        logits = self.policy(x)
+        value = self.value(x).squeeze(-1)
+        return logits, value
 
 
-# -----------------------------
-# RL AGENT (A2C)
-# -----------------------------
+# ============================================================
+# RL AGENT WITH TRAINING PHASES + MODEL IO + TENSORBOARD
+# ============================================================
 
 class MyRLAgent(Player):
-    """
-    A2C-based agent:
-    - 10 discrete actions (4 moves + 6 switch options)
-    - Uses compact, meta-relevant state from state_encoder.encode_state
-    - Actor-Critic (shared backbone) with entropy bonus + gradient clipping
-    - Uses RewardCalculator for dense shaping.
-    """
 
     def __init__(
         self,
         battle_format="gen9ubers",
-        learning_rate=0.00015,        # lower LR → more stable A2C with bucketed features
-        batch_size=256,               # bigger batch → more stable advantage estimates
-        gamma=0.995,                  # longer horizon (switching matters)
-        epsilon_start=1.0,            # start purely exploratory
-        epsilon_end=0.05,             # 5% final exploration
-        epsilon_decay=0.992,          # slower decay → avoids collapsing into bad local policy
-        entropy_coef=0.02,            # stronger entropy → explores better early game
-        value_coef=0.5,               # same as standard A2C
-        model_path=None,
+        gamma=0.995,
+        lr=1.5e-4,
+        epsilon_start=1.0,
+        epsilon_end=0.05,
+        epsilon_decay=0.992,
+        entropy_coef=0.05,
+        value_coef=0.5,
+        batch_size=256,
+        allow_switching=False,            # phase 1 default
+        model_folder=None,
         **kwargs
     ):
-
         super().__init__(battle_format=battle_format, **kwargs)
 
-        self.action_size = 10
-        self.reward_calc = RewardCalculator()
-        self.battle_history = []      # [(state, action, reward), ...]
-        self.episode_buffer = []      # list of episodes
-        self.experience_buffer = []   # flattened (state, action, return)
-        self.prev_battle_state = None
-        self.current_reward_score = 0.0
-        self.last_action_was_switch = False
+        # Action space
+        self.action_size = 10  # 4 moves + 6 switches
 
-        # Model setup
-        self.state_size = None
-        self.model: ActorCriticNet | None = None
-        self.optimizer = None
-        self.batch_size = batch_size
+        # RL hyperparameters
         self.gamma = gamma
-        self.learning_rate = learning_rate
-
-        # A2C loss weights (use passed arguments)
-        self.value_coef = value_coef
+        self.lr = lr
         self.entropy_coef = entropy_coef
+        self.value_coef = value_coef
+        self.batch_size = batch_size
 
-
-        # Epsilon-greedy exploration
+        # Exploration
         self.epsilon = epsilon_start
         self.epsilon_start = epsilon_start
         self.epsilon_end = epsilon_end
         self.epsilon_decay = epsilon_decay
 
-        # Training stats
-        self.training_stats = {
-            "battles_completed": 0,
-            "wins": 0,
-            "losses": 0,
-            "draws": 0,
-            "total_reward": 0.0,
-            "avg_reward_per_battle": [],
-            "win_rate_history": [],
+        # Phase control (Phase 1: moves only)
+        self.allow_switching = allow_switching
+
+        # Reward engine
+        self.reward_calc = RewardCalculator()
+
+        # Buffers
+        self.prev_battle_state = None
+        self.battle_history = []
+        self.episode_buffer = []
+        self.experience_buffer = []
+
+        # Model info
+        self.model = None
+        self.optimizer = None
+        self.state_size = None
+
+        # For reward shaping
+        self.last_action_was_switch = False
+        self.last_action_priority = False
+
+        # TensorBoard
+        self.writer = SummaryWriter(log_dir="runs/rl_training")
+        self.global_train_step = 0
+
+        # Model folder
+        self.model_folder = model_folder
+        if self.model_folder:
+            self._try_load_model()
+
+    # ============================================================
+    # MODEL INIT
+    # ============================================================
+
+    def _init_model(self, state_size):
+        self.state_size = state_size
+        self.model = ActorCriticNet(state_size, self.action_size, hidden_size=512)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        print(f"[RL] Model created (state_size={state_size})")
+
+    # ============================================================
+    # MODEL LOAD / SAVE
+    # ============================================================
+
+    def _try_load_model(self):
+        ckpt_path = os.path.join(self.model_folder, "checkpoint.pth")
+        if not os.path.exists(ckpt_path):
+            print("[RL] No checkpoint found, training from scratch.")
+            return
+
+        print(f"[RL] Loading checkpoint: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+
+        self._init_model(ckpt["state_size"])
+        self.model.load_state_dict(ckpt["model"])
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        self.epsilon = ckpt.get("epsilon", self.epsilon)
+
+        print("[RL] Model loaded successfully.")
+
+    def save_model(self):
+        if self.model is None or not self.model_folder:
+            return
+
+        os.makedirs(self.model_folder, exist_ok=True)
+        ckpt = {
+            "state_size": self.state_size,
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "epsilon": self.epsilon,
         }
 
-        # Try to load existing model
-        if model_path:
-            folder = os.path.join("models", os.path.splitext(os.path.basename(model_path))[0])
-            if os.path.exists(folder):
-                print(f"Model folder found: {folder}")
-                self.load_model(folder)
-            else:
-                print(f"Model folder not found at {folder}, creating new model")
-        else:
-            default_folder = "models/a2c_default"
-            ckpt_path = os.path.join(default_folder, "checkpoint.pth")
-            if os.path.exists(ckpt_path):
-                print(f"Checkpoint found: {ckpt_path}")
-                self.load_model(default_folder)
-            else:
-                print(f"No checkpoint at {ckpt_path}, creating new model on first state encode")
+        ckpt_path = os.path.join(self.model_folder, "checkpoint.pth")
+        torch.save(ckpt, ckpt_path)
+        print(f"[RL] Saved model → {ckpt_path}")
 
-    # -------------------------
-    # MODEL INIT / POLICY
-    # -------------------------
-
-    def _init_model(self, state_size, silent: bool = False):
-        """Initialize Actor-Critic model once we know state vector length."""
-        if self.model is None:
-            self.state_size = state_size
-            self.model = ActorCriticNet(state_size, self.action_size, hidden_size=512)
-            self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-            self.model.train()
-            if not silent:
-                print(f"Created new ActorCritic model (state_size={state_size}, hidden_size=512)")
-
-    def compute_policy(self, state_vec: np.ndarray) -> np.ndarray:
-        """
-        Compute policy using A2C network.
-        Returns action probabilities.
-        """
-        # Ensure model initialized with correct state size
-        if self.model is None:
-            self._init_model(len(state_vec))
-
-        # Safety: pad or truncate if mismatch (shouldn't happen with fixed encoder)
-        current_size = len(state_vec)
-        if current_size < self.state_size:
-            padded = np.zeros(self.state_size, dtype=np.float32)
-            padded[:current_size] = state_vec
-            state_vec = padded
-        elif current_size > self.state_size:
-            state_vec = state_vec[:self.state_size]
-
-        self.model.eval()
-        state_tensor = torch.FloatTensor(state_vec).unsqueeze(0)
-        with torch.no_grad():
-            logits, _ = self.model(state_tensor)
-            probs = torch.softmax(logits, dim=1)
-
-        return probs.squeeze(0).numpy()
-
-    def reset_team(self, team_string):
-        self.set_team(team_string)
-
-    # -------------------------
-    # MAIN DECISION HOOK
-    # -------------------------
-
-    def choose_move(self, battle):
-        """Main hook called by poke-env to choose an action."""
-        # Reward from previous transition
-        if self.prev_battle_state is not None and not battle.finished:
-            turn_reward = self.reward_calc.compute_turn_reward(
-                self.prev_battle_state,
-                battle,
-                action_was_switch=self.last_action_was_switch
-            )
-            self.current_reward_score += turn_reward
-
-            if len(self.battle_history) > 0:
-                prev_state, prev_action, _ = self.battle_history[-1]
-                self.battle_history[-1] = (prev_state, prev_action, turn_reward)
-
-        # Encode current state with your new encoder
-        state_vec = encode_state(battle)
-        legal = self.legal_actions(battle)
-
-        # Ensure model initialized
-        if self.model is None:
-            self._init_model(len(state_vec))
-
-        # Epsilon-greedy on top of policy
-        if np.random.random() < self.epsilon:
-            action_index = np.random.choice(legal) if legal else 0
-            move = self.action_to_move(action_index, battle)
-        else:
-            policy = self.compute_policy(state_vec)
-
-            masked_policy = policy.copy()
-            for i in range(self.action_size):
-                if i not in legal:
-                    masked_policy[i] = 0.0
-
-            if masked_policy.sum() > 0:
-                masked_policy = masked_policy / masked_policy.sum()
-                action_index = np.random.choice(self.action_size, p=masked_policy)
-            else:
-                action_index = np.random.choice(legal) if legal else 0
-
-            if action_index not in legal:
-                move = self.choose_random_legal_action(battle)
-                legal_now = self.legal_actions(battle)
-                action_index = legal_now[0] if legal_now else 0
-            else:
-                move = self.action_to_move(action_index, battle)
-
-        # Store (state, action, reward placeholder)
-        self.battle_history.append((state_vec.copy(), action_index, 0.0))
-        self.last_action_was_switch = (action_index >= 4)
-        # For RewardCalculator API compatibility (it ignores this snapshot now)
-        self.prev_battle_state = {"turn": battle.turn}
-
-        return move
-
-    # -------------------------
-    # ACTION SPACE / MAPPING
-    # -------------------------
+    # ============================================================
+    # LEGAL ACTIONS (PHASE-DEPENDENT, RECURSION-SAFE)
+    # ============================================================
 
     def legal_actions(self, battle):
-        """
-        Return list of legal action indices in [0, 9]:
-        - 0–3: move slots
-        - 4–9: switch slots
-        """
-        indices = []
+        legal = []
 
-        # Moves
-        for i, move in enumerate(battle.available_moves):
-            if move is not None and i < 4:
-                indices.append(i)
+        # ----------------------------------------------------------
+        # If Pokémon is fainted or missing → forced switching only
+        # ----------------------------------------------------------
+        if (
+            battle.active_pokemon is None
+            or battle.active_pokemon.fainted
+            or battle.active_pokemon.current_hp == 0
+        ):
+            for i, p in enumerate(battle.available_switches):
+                if p is not None:
+                    legal.append(SWITCH_OFFSET + i)
+            return legal  # ONLY switches allowed
 
-        # Switches
-        for i, poke in enumerate(battle.available_switches):
-            if poke is not None and i < 6:
-                indices.append(4 + i)
+        # ----------------------------------------------------------
+        # PHASE 1 — MOVES ONLY (no manual switching, no pivot moves)
+        # ----------------------------------------------------------
+        if not self.allow_switching:
+            for i, m in enumerate(battle.available_moves):
+                if m is None or i >= 4:
+                    continue
+                # Block pivot moves (U-turn, VoltTurn, FlipTurn, Parting Shot)
+                if m.id in PIVOT_MOVES:
+                    continue
+                legal.append(i)
 
-        return indices
+            # If no legal moves (e.g. all PP stalled, Encore corner cases),
+            # allow forced switch as a fallback.
+            if len(legal) == 0:
+                for i, p in enumerate(battle.available_switches):
+                    if p is not None:
+                        legal.append(SWITCH_OFFSET + i)
+
+            return legal
+
+        # ----------------------------------------------------------
+        # PHASE 2 — FULL ACTION SET (moves + switches, pivot allowed)
+        # ----------------------------------------------------------
+        # Moves 0–3
+        for i, m in enumerate(battle.available_moves):
+            if m is not None and i < 4:
+                legal.append(i)
+
+        # Switches 4–9
+        for i, p in enumerate(battle.available_switches):
+            if p is not None:
+                legal.append(SWITCH_OFFSET + i)
+
+        return legal
+
+    # ============================================================
+    # ACTION → MOVE (RECURSION-SAFE)
+    # ============================================================
 
     def action_to_move(self, action, battle):
-        """Map an integer action index to a poke-env Order object."""
-        # 0–3: moves
+        # -----------------------------
+        # MOVE ACTION (0–3)
+        # -----------------------------
         if 0 <= action <= 3:
             moves = battle.available_moves
+
             if action < len(moves) and moves[action] is not None:
-                return self.create_order(moves[action])
+                m = moves[action]
+                self.last_action_priority = (m.priority > 0)
+                self.last_action_was_switch = False
+                return self.create_order(m)
+
+            # Fallback: try any other available move
+            for i, m in enumerate(moves):
+                if m is not None and i < 4:
+                    self.last_action_priority = (m.priority > 0)
+                    self.last_action_was_switch = False
+                    return self.create_order(m)
+
+            # If no moves are available at all, fallback to random legal choice
             return self.choose_random_legal_action(battle)
 
-        # 4–9: switches
-        if 4 <= action <= 9:
-            idx = action - 4
+        # -----------------------------
+        # SWITCH ACTION (4+)
+        # -----------------------------
+        if action >= SWITCH_OFFSET:
+            idx = action - SWITCH_OFFSET
             switches = battle.available_switches
+
             if idx < len(switches) and switches[idx] is not None:
+                self.last_action_priority = False
+                self.last_action_was_switch = True
                 return self.create_order(switches[idx])
+
+            # Fallback: pick first valid switch
+            for i, p in enumerate(switches):
+                if p is not None:
+                    self.last_action_priority = False
+                    self.last_action_was_switch = True
+                    return self.create_order(p)
+
+            # If no switches are valid, fallback to random legal choice
             return self.choose_random_legal_action(battle)
 
+        # -----------------------------
+        # Completely invalid action index
+        # -----------------------------
         return self.choose_random_legal_action(battle)
 
+    # ============================================================
+    # RANDOM LEGAL ACTION (uses safe mapping above)
+    # ============================================================
+
     def choose_random_legal_action(self, battle):
-        """Sample uniformly from currently legal actions."""
         legal = self.legal_actions(battle)
+
+        # Extremely defensive guard (should basically never be empty)
         if not legal:
-            return self.choose_random_move(battle)
+            # Try to default to any available move or switch
+            if battle.available_moves:
+                for m in battle.available_moves:
+                    if m is not None:
+                        self.last_action_priority = (m.priority > 0)
+                        self.last_action_was_switch = False
+                        return self.create_order(m)
+            if battle.available_switches:
+                for p in battle.available_switches:
+                    if p is not None:
+                        self.last_action_priority = False
+                        self.last_action_was_switch = True
+                        return self.create_order(p)
+            # If literally nothing, just return a pass (shouldn't happen)
+            return self.choose_default_move(battle)
+
         a = np.random.choice(legal)
-        move = self.action_to_move(a, battle)
-        self.last_action_was_switch = (a >= 4)
-        return move
+        return self.action_to_move(a, battle)
 
-    # -------------------------
-    # EPISODE END / TRAINING ENTRY
-    # -------------------------
+    # ============================================================
+    # CHOOSE MOVE
+    # ============================================================
 
-    def on_battle_end(self, battle):
-        """Called when battle ends — compute final reward, update buffers, train, decay epsilon."""
-        # Final turn reward
-        if self.prev_battle_state is not None:
-            turn_reward = self.reward_calc.compute_turn_reward(
+    def choose_move(self, battle):
+
+        # Reward from previous state
+        if self.prev_battle_state is not None and not battle.finished:
+            r = self.reward_calc.compute_turn_reward(
                 self.prev_battle_state,
                 battle,
-                action_was_switch=self.last_action_was_switch
+                action_was_switch=self.last_action_was_switch,
             )
-            self.current_reward_score += turn_reward
+            if self.battle_history:
+                s, a, _ = self.battle_history[-1]
+                self.battle_history[-1] = (s, a, r)
 
-            if len(self.battle_history) > 0:
-                prev_state, prev_action, _ = self.battle_history[-1]
-                self.battle_history[-1] = (prev_state, prev_action, turn_reward)
+        # Encode state
+        state_vec = encode_state(battle).astype(np.float32)
+        if self.model is None:
+            self._init_model(len(state_vec))
+
+        legal = self.legal_actions(battle)
+
+        # Defensive guard
+        if not legal:
+            move = self.choose_random_legal_action(battle)
+            self.prev_battle_state = battle
+            self.battle_history.append((state_vec.copy(), 0, 0.0))
+            return move
+
+        # Epsilon-greedy
+        if np.random.random() < self.epsilon:
+            action = np.random.choice(legal)
+            move = self.action_to_move(action, battle)
+
+        else:
+            st = torch.FloatTensor(state_vec).unsqueeze(0)
+            self.model.eval()
+            with torch.no_grad():
+                logits, _ = self.model(st)
+                probs = torch.softmax(logits, dim=1).squeeze().numpy()
+
+            mask = np.zeros_like(probs)
+            mask[legal] = probs[legal]
+
+            if mask.sum() == 0:
+                action = np.random.choice(legal)
+            else:
+                mask /= mask.sum()
+                temperature = max(0.3, self.epsilon)
+                dist = mask ** (1 / temperature)
+                dist /= dist.sum()
+                action = np.random.choice(len(dist), p=dist)
+
+            move = self.action_to_move(action, battle)
+
+        # Mark switch usage based on action index (forced or manual)
+        self.last_action_was_switch = (action >= SWITCH_OFFSET)
+
+        # Store transition
+        self.battle_history.append((state_vec.copy(), action, 0.0))
+        self.prev_battle_state = battle
+
+        return move
+
+    # ============================================================
+    # BATTLE END
+    # ============================================================
+
+    def on_battle_end(self, battle):
+
+        # Final intermediate reward
+        if self.prev_battle_state is not None and self.battle_history:
+            r = self.reward_calc.compute_turn_reward(
+                self.prev_battle_state,
+                battle,
+                action_was_switch=self.last_action_was_switch,
+            )
+            s, a, old = self.battle_history[-1]
+            self.battle_history[-1] = (s, a, old + r)
 
         # Terminal reward
-        terminal_reward = self.reward_calc.compute_terminal_reward(battle)
-        self.current_reward_score += terminal_reward
+        terminal = self.reward_calc.terminal_reward(battle)
+        if self.battle_history:
+            s, a, old = self.battle_history[-1]
+            self.battle_history[-1] = (s, a, old + terminal)
 
-        if len(self.battle_history) > 0:
-            prev_state, prev_action, prev_r = self.battle_history[-1]
-            self.battle_history[-1] = (prev_state, prev_action, prev_r + terminal_reward)
-
-        # Store episode + compute returns
-        if len(self.battle_history) > 0:
+        # Store episode
+        if self.battle_history:
             self.episode_buffer.append(self.battle_history.copy())
             self._process_episodes()
 
-        # Stats
-        self.training_stats["battles_completed"] += 1
+        # Reset
+        self.reward_calc.reset()
+        self.prev_battle_state = None
+        self.battle_history = []
+        self.last_action_was_switch = False
+        self.last_action_priority = False
 
-        if battle.won:
-            self.training_stats["wins"] += 1
-        elif battle.lost:
-            self.training_stats["losses"] += 1
-        else:
-            self.training_stats["draws"] += 1
+        # Decay epsilon
+        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
 
-        self.training_stats["total_reward"] += self.current_reward_score
-        self.training_stats["avg_reward_per_battle"].append(self.current_reward_score)
-
-        win_rate = self.training_stats["wins"] / self.training_stats["battles_completed"]
-        self.training_stats["win_rate_history"].append(win_rate)
-
-        # Epsilon decay
-        decay_factor = self.epsilon_decay ** (1 + self.training_stats["battles_completed"] / 5000)
-        self.epsilon = max(self.epsilon_end, self.epsilon * decay_factor)
-
-        # Train if batch ready
+        # Train if enough data
         if len(self.experience_buffer) >= self.batch_size:
             self._train_batch()
 
-        # Logging
-        if self.training_stats["battles_completed"] % 50 == 0:
-            print(
-                f"Battles: {self.training_stats['battles_completed']}, "
-                f"Win Rate: {win_rate:.2%}, "
-                f"Epsilon: {self.epsilon:.4f}, "
-                f"Reward (last): {self.current_reward_score:.2f}"
-            )
-
-        # Reset per-battle values
-        self.reward_calc.reset()
-        self.prev_battle_state = None
-        self.current_reward_score = 0.0
-        self.last_action_was_switch = False
-        self.battle_history = []
-
-    # -------------------------
+    # ============================================================
     # EPISODE PROCESSING
-    # -------------------------
+    # ============================================================
 
     def _process_episodes(self):
-        """Compute discounted returns per episode and flatten into experience_buffer."""
-        while len(self.episode_buffer) > 0:
-            episode = self.episode_buffer.pop(0)
+        while self.episode_buffer:
+            ep = self.episode_buffer.pop(0)
 
             returns = []
             G = 0.0
-            for i in range(len(episode) - 1, -1, -1):
-                _, _, reward = episode[i]
-                G = reward + self.gamma * G
+            for _, _, r in reversed(ep):
+                G = r + self.gamma * G
                 returns.insert(0, G)
 
-            for (state, action, _), return_val in zip(episode, returns):
-                self.experience_buffer.append((state, action, return_val))
+            for (s, a, _), R in zip(ep, returns):
+                self.experience_buffer.append((s, a, R))
 
-    # -------------------------
-    # A2C TRAINING STEP
-    # -------------------------
+    # ============================================================
+    # TRAINING STEP
+    # ============================================================
 
     def _train_batch(self):
-        """
-        Train Actor-Critic on a batch of experiences:
-          - policy loss = -logπ(a|s) * advantage
-          - value loss = MSE(V(s), return)
-          - entropy bonus encourages exploration
-          - gradient clipping for stability
-        """
-        if self.model is None or len(self.experience_buffer) < self.batch_size:
-            return
-
         batch = self.experience_buffer[:self.batch_size]
         self.experience_buffer = self.experience_buffer[self.batch_size:]
 
-        states = []
-        actions = []
-        returns = []
-
-        for state, action, return_val in batch:
-            state = np.array(state, dtype=np.float32)
-
-            # Safety: pad / truncate to state_size
-            current_size = len(state)
-            if current_size < self.state_size:
-                padded = np.zeros(self.state_size, dtype=np.float32)
-                padded[:current_size] = state
-                state = padded
-            elif current_size > self.state_size:
-                state = state[:self.state_size]
-
-            states.append(state)
-            actions.append(action)
-            returns.append(return_val)
-
-        states_tensor = torch.FloatTensor(np.array(states))
-        actions_tensor = torch.LongTensor(actions)
-        returns_tensor = torch.FloatTensor(returns)
+        states = np.array([b[0] for b in batch], dtype=np.float32)
+        actions = np.array([b[1] for b in batch], dtype=np.int64)
+        returns = np.array([b[2] for b in batch], dtype=np.float32)
 
         # Normalize returns
-        returns_tensor = (returns_tensor - returns_tensor.mean()) / (returns_tensor.std() + 1e-8)
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
-        self.model.train()
-        self.optimizer.zero_grad()
+        st = torch.FloatTensor(states)
+        at = torch.LongTensor(actions)
+        rt = torch.FloatTensor(returns)
 
-        logits, values = self.model(states_tensor)
+        logits, values = self.model(st)
         probs = torch.softmax(logits, dim=1)
         log_probs = torch.log(probs + 1e-8)
 
-        selected_log_probs = log_probs.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
+        selected_logprobs = log_probs[range(len(at)), at]
 
-        # Advantage = G_t - V(s_t)
-        advantages = returns_tensor - values.detach()
+        # Advantage
+        advantages = rt - values.detach()
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # Loss terms
-        policy_loss = -(selected_log_probs * advantages).mean()
-        value_loss = F.mse_loss(values, returns_tensor)
+        policy_loss = -(selected_logprobs * advantages).mean()
+        value_loss = F.mse_loss(values, rt)
         entropy = -(probs * log_probs).sum(dim=1).mean()
 
         loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
 
+        # Gradient step
+        self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
+        # TensorBoard logging
+        self.writer.add_scalar("Loss/Total", loss.item(), self.global_train_step)
+        self.writer.add_scalar("Loss/Policy", policy_loss.item(), self.global_train_step)
+        self.writer.add_scalar("Loss/Value", value_loss.item(), self.global_train_step)
+        self.writer.add_scalar("Entropy", entropy.item(), self.global_train_step)
+        self.writer.add_scalar("Epsilon", self.epsilon, self.global_train_step)
+
+        self.global_train_step += 1
+
         print(
-            f"Training batch | "
-            f"Loss: {loss.item():.4f} | "
-            f"Policy: {policy_loss.item():.4f} | "
-            f"Value: {value_loss.item():.4f} | "
-            f"Entropy: {entropy.item():.4f} | "
-            f"Epsilon: {self.epsilon:.3f}"
+            f"[TRAIN] loss={loss.item():.4f} "
+            f"policy={policy_loss.item():.4f} "
+            f"value={value_loss.item():.4f} "
+            f"entropy={entropy.item():.4f} "
+            f"eps={self.epsilon:.3f} "
+            f"switching={'ON' if self.allow_switching else 'OFF'}"
         )
-
-        self.model.eval()
-
-    # -------------------------
-    # SAVE / LOAD
-    # -------------------------
-
-    def save_results(self, filename="training_results.json"):
-        """Save training statistics to JSON file."""
-        if self.training_stats["battles_completed"] == 0:
-            print("Warning: No battles completed. Results file will contain zeros.")
-
-        results = {
-            "total_battles": self.training_stats["battles_completed"],
-            "wins": self.training_stats["wins"],
-            "losses": self.training_stats["losses"],
-            "draws": self.training_stats["draws"],
-            "win_rate": self.training_stats["wins"] / max(self.training_stats["battles_completed"], 1),
-            "total_reward": self.training_stats["total_reward"],
-            "avg_reward_per_battle": (
-                np.mean(self.training_stats["avg_reward_per_battle"])
-                if self.training_stats["avg_reward_per_battle"] else 0.0
-            ),
-            "win_rate_history": self.training_stats["win_rate_history"],
-            "rewards_per_battle": self.training_stats["avg_reward_per_battle"],
-        }
-
-        with open(filename, "w") as f:
-            json.dump(results, f, indent=2)
-
-        print(f"Results saved to {filename}")
-        if self.training_stats["battles_completed"] > 0:
-            print(f"  Completed: {self.training_stats['battles_completed']} battles")
-            print(f"  Win rate: {results['win_rate']:.2%}")
-
-    def save_model(self, folder="models/a2c_default"):
-        os.makedirs(folder, exist_ok=True)
-
-        ckpt = {
-            "state_size": self.state_size,
-            "model_state": self.model.state_dict(),
-            "optimizer_state": self.optimizer.state_dict(),
-            "epsilon": self.epsilon,
-            "training_stats": self.training_stats,
-        }
-
-        path = os.path.join(folder, "checkpoint.pth")
-        torch.save(ckpt, path)
-        print(f"[A2C] Model saved → {path}")
-
-    def load_model(self, folder="models/a2c_default"):
-        path = os.path.join(folder, "checkpoint.pth")
-        if not os.path.exists(path):
-            print(f"[A2C] No checkpoint found at {path}. Starting fresh.")
-            return False
-
-        ckpt = torch.load(path, map_location="cpu")
-
-        self.state_size = ckpt["state_size"]
-        self._init_model(self.state_size, silent=True)
-
-        self.model.load_state_dict(ckpt["model_state"])
-        self.optimizer.load_state_dict(ckpt["optimizer_state"])
-
-        self.epsilon = ckpt.get("epsilon", self.epsilon)
-        self.training_stats = ckpt.get("training_stats", self.training_stats)
-
-        print(f"[A2C] Loaded model from {path}")
-        return True

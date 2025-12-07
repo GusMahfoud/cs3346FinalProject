@@ -40,3 +40,6 @@ def build_species_stats(path: str = POOL_PATH):
         species_stats[species_id] = full_stats
 
     return species_stats
+
+# Build and export full species stat table at import time
+SPECIES_STATS = build_species_stats()
