@@ -13,7 +13,7 @@ from showdown_server import start_showdown_server
 # ============================================================
 MINIBATCH = 50
 MAX_PARALLEL = 16
-MODEL_FOLDER = "models/a2c_v6"
+MODEL_FOLDER = "models/a2c_v7"
 
 ROLLING_WINDOW = 20   # number of minibatches for rolling winrate
 
