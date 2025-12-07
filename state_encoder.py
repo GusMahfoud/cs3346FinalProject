@@ -3,11 +3,11 @@ import numpy as np
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.move import Move
 
-from team_pool_loader import SPECIES_STATS    # precomputed stats (hp, atk, def, spa, spd, spe)
+from team_pool_loader import SPECIES_STATS    # hp/atk/def/spa/spd/spe true stats
 
 
 # ============================================================
-# FIXED POKEMON ORDER (must match your pool)
+# FIXED POKEMON ORDER (MUST MATCH YOUR POOL)
 # ============================================================
 POKEMON_ORDER = [
     "dragapult",
@@ -28,22 +28,26 @@ def _norm(name: str) -> str:
 
 
 # ============================================================
-# TRUE STATS LOOKUP (SAFE)
+# SPECIES ONE-HOT
 # ============================================================
-def get_true_stats(pokemon):
-    """
-    Returns full stats from SPECIES_STATS (hp, atk, def, spa, spd, spe).
-    Works for both ally + opponent Pokémon.
-    Never depends on EVs/IVs/nature sent by Showdown.
-    """
+def species_one_hot(p: Pokemon):
+    vec = [0] * len(POKEMON_ORDER)
+    if p is None:
+        return vec
+    sid = SPECIES_INDEX.get(_norm(p.species))
+    if sid is not None:
+        vec[sid] = 1
+    return vec
 
-    if pokemon is None or pokemon.species is None:
+
+# ============================================================
+# TRUE STATS (no EV/IV/nature dependency)
+# ============================================================
+def get_true_stats(p: Pokemon):
+    if p is None or p.species is None:
         return {"hp": 0, "atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0}
-
-    sid = _norm(pokemon.species)
-
     return SPECIES_STATS.get(
-        sid,
+        _norm(p.species),
         {"hp": 0, "atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0},
     )
 
@@ -56,12 +60,10 @@ def hp_bucket(p: Pokemon) -> float:
         return 0.0
 
     frac = (p.current_hp or 0) / p.max_hp
-
     if frac <= 0.25: b = 0
     elif frac <= 0.50: b = 1
     elif frac <= 0.75: b = 2
     else: b = 3
-
     return b / 3.0
 
 
@@ -74,193 +76,149 @@ def speed_bucket(raw_speed: int) -> float:
 
 
 # ============================================================
-# MOVESET CATEGORIES
+# MOVE CATEGORIES + NON-DAMAGE EFFECTS
 # ============================================================
 SETUP_MOVES = {
-    "swordsdance", "nastyplot", "quiverdance", "calmmind",
-    "bellydrum", "torchsong"
+    "swordsdance", "nastyplot", "quiverdance",
+    "calmmind", "bellydrum", "torchsong"
 }
 
-PRIORITY_MOVES = {
-    "iceshard", "suckerpunch", "shadowsneak"
-}
+RECOVERY_MOVES = {"recover", "slackoff", "roost", "moonlight", "morningsun"}
+PIVOT_MOVES = {"uturn", "voltswitch", "flipturn", "partingshot"}
+PROTECT_MOVES = {"protect"}
 
 
 # ============================================================
-# MOVESET SUMMARY
+# PER-MOVE ENCODING (10 dims per move)
 # ============================================================
-def summarize_moves(mon: Pokemon, opp: Pokemon):
+def encode_move(m: Move, user: Pokemon, opp: Pokemon):
     """
-    Returns:
-      has_priority, has_setup, best_damage_ratio, has_SE
+    10-dim move vector:
+    [
+      base_power_norm,
+      STAB_flag,
+      effectiveness_norm,
+      priority_flag,
+      setup_flag,
+      status_flag,
+      secondary_flag,
+      recovery_flag,
+      pivot_flag,
+      protect_flag
+    ]
     """
+    if m is None:
+        return [0]*10
 
-    if mon is None or mon.moves is None:
-        return [0, 0, 0.0, 0]
+    # Base power normalization
+    bp_norm = min((m.base_power or 0) / 150, 1.0)
 
-    has_prio = 0
-    has_setup = 0
-    has_se = 0
-    best = 0.0
+    # STAB
+    try:
+        stab = 1 if m.type in {user.type_1, user.type_2} else 0
+    except:
+        stab = 0
 
+    # Type effectiveness
     opp_types = (opp.type_1, opp.type_2) if opp else (None, None)
-    opp_hp = opp.max_hp if opp else 1
+    try:
+        eff = m.type.damage_multiplier(*opp_types)
+    except:
+        eff = 1.0
+    eff_norm = min(eff / 4.0, 1.0)
 
-    for mv in mon.moves.values():
-        if mv is None:
-            continue
+    # Flags
+    priority = 1 if m.priority > 0 else 0
+    is_setup = 1 if m.id in SETUP_MOVES else 0
+    is_status = 1 if m.category.name == "STATUS" else 0
+    has_secondary = 1 if getattr(m, "secondary", None) else 0
+    recovery = 1 if m.id in RECOVERY_MOVES else 0
+    pivot = 1 if m.id in PIVOT_MOVES else 0
+    protect = 1 if m.id in PROTECT_MOVES else 0
 
-        mid = mv.id
-
-        if mid in PRIORITY_MOVES:
-            has_prio = 1
-
-        if mid in SETUP_MOVES:
-            has_setup = 1
-
-        # damage approx if base_power exists
-        if mv.base_power:
-            mult = 1.0
-            try:
-                mult = mv.type.damage_multiplier(*opp_types)
-            except:
-                pass
-
-            dmg = mv.base_power * mult
-
-            # STAB
-            try:
-                if mv.type in {mon.type_1, mon.type_2}:
-                    dmg *= 1.5
-            except:
-                pass
-
-            best = max(best, min(dmg / max(opp_hp, 1), 1.0))
-
-            if mult > 1.0:
-                has_se = 1
-
-    return [has_prio, has_setup, best, has_se]
-
-
-# ============================================================
-# ACTIVE PAIR ENCODING
-# ============================================================
-def encode_active_pair(my: Pokemon, opp: Pokemon):
-    """
-    Encodes:
-      my_hp_bucket
-      opp_hp_bucket
-      my_speed_bucket
-      opp_speed_bucket
-      faster_flag
-      my_moves_summary (4)
-      opp_moves_summary (4)
-      my_atk_boost
-      my_spa_boost
-      opp_atk_boost
-      opp_spa_boost
-    """
-
-    my_stats = get_true_stats(my)
-    opp_stats = get_true_stats(opp)
-
-    my_speed = my_stats["spe"]
-    opp_speed = opp_stats["spe"]
-
-    faster = 1 if my_speed > opp_speed else 0
-
-    vec = [
-        hp_bucket(my),
-        hp_bucket(opp),
-        speed_bucket(my_speed),
-        speed_bucket(opp_speed),
-        faster,
+    return [
+        bp_norm, stab, eff_norm, priority,
+        is_setup, is_status, has_secondary,
+        recovery, pivot, protect
     ]
 
-    # moveset summaries
-    vec.extend(summarize_moves(my, opp))
-    vec.extend(summarize_moves(opp, my))
 
-    # boosts
-    def boost(mon, k):
-        if mon is None:
-            return 0.0
-        stage = mon.boosts.get(k, 0)
-        return (max(-6, min(6, stage)) + 6) / 12.0
-
-    vec.append(boost(my, "atk"))
-    vec.append(boost(my, "spa"))
-    vec.append(boost(opp, "atk"))
-    vec.append(boost(opp, "spa"))
-
+# A Pokémon has up to 4 moves → 4 × 10 = 40 dims
+def encode_moveset(user: Pokemon, opp: Pokemon):
+    moves = list(user.moves.values()) if (user and user.moves) else []
+    vec = []
+    for i in range(4):
+        mv = moves[i] if i < len(moves) else None
+        vec.extend(encode_move(mv, user, opp))
     return vec
 
 
 # ============================================================
-# BENCH ENCODING
+# BOOST ENCODING (atk/def/spa/spd/spe)
 # ============================================================
-def sorted_bench(team, active):
-    mons = [p for p in team.values() if p is not active]
+def boost_norm(p: Pokemon, name: str):
+    if p is None:
+        return 0.0
+    b = p.boosts.get(name, 0)
+    return (b + 6) / 12.0
 
-    def key_fn(p):
-        if p is None:
-            return 999
-        return SPECIES_INDEX.get(_norm(p.species), 999)
 
-    return sorted(mons, key=key_fn)
+# ============================================================
+# BENCH ENCODING (48 dims per mon)
+# ============================================================
+def bench_list(team, active):
+    bench = [p for p in team.values() if p is not active]
+    return sorted(
+        bench,
+        key=lambda p: SPECIES_INDEX.get(_norm(p.species), 999)
+    )
 
 
 def encode_bench(team, active, opp):
     """
-    For each bench mon:
-      hp_bucket
-      speed_bucket
-      faster_than_opp
-      moves_summary (4)
-    Total = 7 features per mon, padded to 5 mons => 35 dims.
+    Per bench Pokémon:
+      species_one_hot (6)
+      hp_bucket (1)
+      speed_bucket (1)
+      moveset (40)
+
+    48 dims per mon × 5 mons = 240 dims
     """
-
     vec = []
-    opp_stats = get_true_stats(opp)
-    opp_speed = opp_stats["spe"]
+    mons = bench_list(team, active)
 
-    for p in sorted_bench(team, active):
-        ps = get_true_stats(p)
-        pspeed = ps["spe"]
+    for p in mons:
+        stats = get_true_stats(p)
+        vec.extend(species_one_hot(p))
+        vec.append(hp_bucket(p))
+        vec.append(speed_bucket(stats["spe"]))
+        vec.extend(encode_moveset(p, opp))
 
-        vec.extend([
-            hp_bucket(p),
-            speed_bucket(pspeed),
-            1 if pspeed > opp_speed else 0,
-        ])
-
-        vec.extend(summarize_moves(p, opp))
-
-    while len(vec) < 35:
-        vec.extend([0] * 7)
+    # pad to 5 mons × 48 dims
+    while len(vec) < 48 * 5:
+        vec.extend([0]*48)
 
     return vec
 
 
 # ============================================================
-# ALIVE ENCODING
+# ALIVE FLAGS
 # ============================================================
-def encode_alive(battle):
-    my_flags = [0] * len(POKEMON_ORDER)
-    opp_flags = [0] * len(POKEMON_ORDER)
+def encode_alive_flags(battle):
+    my = [0]*len(POKEMON_ORDER)
+    opp = [0]*len(POKEMON_ORDER)
 
     for p in battle.team.values():
-        idx = SPECIES_INDEX.get(_norm(p.species))
-        if idx is not None:
-            my_flags[idx] = 0 if p.fainted else 1
+        sid = SPECIES_INDEX.get(_norm(p.species))
+        if sid is not None:
+            my[sid] = 0 if p.fainted else 1
 
     for p in battle.opponent_team.values():
-        idx = SPECIES_INDEX.get(_norm(p.species))
-        if idx is not None:
-            opp_flags[idx] = 0 if p.fainted else 1
+        sid = SPECIES_INDEX.get(_norm(p.species))
+        if sid is not None:
+            opp[sid] = 0 if p.fainted else 1
 
-    return my_flags + opp_flags
+    return my + opp
 
 
 # ============================================================
@@ -275,17 +233,46 @@ def turn_bucket(turn: int):
 
 
 # ============================================================
-# MAIN ENCODER
+# MAIN STATE ENCODER
 # ============================================================
 def encode_state(battle):
     my = battle.active_pokemon
     opp = battle.opponent_active_pokemon
 
+    my_stats = get_true_stats(my)
+    opp_stats = get_true_stats(opp)
+
     vec = []
-    vec.extend(encode_active_pair(my, opp))
+
+    # --- 1. Species identity ---
+    vec.extend(species_one_hot(my))
+    vec.extend(species_one_hot(opp))
+
+    # --- 2. HP + Speed ---
+    vec.append(hp_bucket(my))
+    vec.append(hp_bucket(opp))
+    vec.append(speed_bucket(my_stats["spe"]))
+    vec.append(speed_bucket(opp_stats["spe"]))
+    vec.append(1 if my_stats["spe"] > opp_stats["spe"] else 0)
+
+    # --- 3. Movesets (active mon + opponent mon) ---
+    vec.extend(encode_moveset(my, opp))
+    vec.extend(encode_moveset(opp, my))
+
+    # --- 4. Boosts (my + opp) ---
+    for stat in ("atk", "def", "spa", "spd", "spe"):
+        vec.append(boost_norm(my, stat))
+    for stat in ("atk", "def", "spa", "spd", "spe"):
+        vec.append(boost_norm(opp, stat))
+
+    # --- 5. Bench (mine + opponent) ---
     vec.extend(encode_bench(battle.team, my, opp))
     vec.extend(encode_bench(battle.opponent_team, opp, my))
-    vec.extend(encode_alive(battle))
+
+    # --- 6. Alive flags ---
+    vec.extend(encode_alive_flags(battle))
+
+    # --- 7. Turn bucket ---
     vec.append(turn_bucket(battle.turn))
 
     return np.array(vec, dtype=np.float32)
