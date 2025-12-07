@@ -22,23 +22,23 @@ from fixed_ais import (
 # ============================================================
 MINIBATCH = 50
 MAX_PARALLEL = 16
-MODEL_FOLDER = "models/a2c_v12"
+MODEL_FOLDER = "models/a2c_v14"
 
 ROLLING_WINDOW = 20
 
 # Phase thresholds
 WARMUP_THRESHOLD = 0.55
 PHASE1_THRESHOLD = 0.57
-PHASE2A_THRESHOLD = 0.67
+PHASE2A_THRESHOLD = 0.85
 PHASE2B_THRESHOLD = 0.70  # mastery
 
 # Minimum cycles per stage
 MIN_WARMUP_CYCLES = 4
 MIN_PHASE1_CYCLES = 50
-MIN_PHASE2A_CYCLES = 12
+MIN_PHASE2A_CYCLES = 50
 
 # Allow resuming from anywhere
-START_PHASE = "warmup"   # "warmup" | "phase1" | "phase2a" | "phase2b"
+START_PHASE = "phase2a"   # "warmup" | "phase1" | "phase2a" | "phase2b"
 
 
 # ============================================================
@@ -89,6 +89,7 @@ async def train_forever():
         )
         rl_agent.allow_switching = False
         rl_agent.use_expert_switching = False
+        rl_agent.rl_switch_enabled = False
 
     elif phase == "phase1":
         ai_agent = FixedOrderMaxBasePower(
@@ -98,6 +99,7 @@ async def train_forever():
         )
         rl_agent.allow_switching = False
         rl_agent.use_expert_switching = False
+        rl_agent.rl_switch_enabled = False
 
     elif phase == "phase2a":
         ai_agent = FixedOrderMaxBasePower(
@@ -105,8 +107,9 @@ async def train_forever():
             max_concurrent_battles=MAX_PARALLEL,
             team=team_ai,
         )
-        rl_agent.allow_switching = False
+        rl_agent.allow_switching = True
         rl_agent.use_expert_switching = True
+        rl_agent.rl_switch_enabled = False
 
     elif phase == "phase2b":
         ai_agent = FixedOrderSimpleHeuristics(
@@ -115,7 +118,8 @@ async def train_forever():
             team=team_ai,
         )
         rl_agent.allow_switching = True
-        rl_agent.use_expert_switching = False
+        rl_agent.use_expert_switching = True
+        rl_agent.rl_switch_enabled = False
 
     else:
         raise ValueError(f"Invalid START_PHASE: {START_PHASE}")

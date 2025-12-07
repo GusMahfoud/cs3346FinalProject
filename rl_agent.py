@@ -101,6 +101,7 @@ class MyRLAgent(Player):
         self.allow_switching = allow_switching
         self.use_expert_switching = use_expert_switching
         self.expert_imitation_bonus = expert_imitation_bonus
+        self.rl_switch_enabled = rl_switch_enabled
         self.switch_expert = SwitchHeuristics()
 
         # Reward engine

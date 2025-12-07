@@ -37,7 +37,6 @@ def type_one_hot(p: Pokemon):
     vec = [0] * len(TYPE_LIST)
     if p is None:
         return vec
-
     for t in (p.type_1, p.type_2):
         if t and t.name.lower() in TYPE_INDEX:
             vec[TYPE_INDEX[t.name.lower()]] = 1
@@ -51,7 +50,6 @@ def species_one_hot(p: Pokemon):
     vec = [0] * len(POKEMON_ORDER)
     if p is None:
         return vec
-
     sid = SPECIES_INDEX.get(_norm(p.species))
     if sid is not None:
         vec[sid] = 1
@@ -72,14 +70,37 @@ def hp_bucket_10(p: Pokemon):
 
 
 # ============================================================
-# SPEED BUCKET (based on computed stats)
+# SPEED BUCKET USING REAL STATS
 # ============================================================
 def speed_bucket(raw: int):
-    if raw < 100: b = 0
+    if raw < 150: b = 0
     elif raw < 200: b = 1
-    elif raw < 300: b = 2
-    else: b = 3
-    return b / 3.0
+    elif raw < 260: b = 2
+    elif raw < 320: b = 3
+    else: b = 4
+    return b / 4.0
+
+
+# ============================================================
+# NEW: STAT BUCKETS (ATK/DEF/SPA/SPD/SPE)
+# ============================================================
+# Stat bucket thresholds
+STAT_BUCKETS = {
+    "atk":  [180, 260, 310],
+    "def":  [200, 250, 300],
+    "spa":  [180, 260, 330],
+    "spd":  [180, 220, 260],
+    "hp":   [300, 360]
+}
+
+def stat_bucket(statname, value):
+    cuts = STAT_BUCKETS[statname]
+
+    if value < cuts[0]: return 0
+    elif value < cuts[1]: return 1
+    elif len(cuts) == 3 and value < cuts[2]: return 2
+    else: return 3
+
 
 
 # ============================================================
@@ -101,13 +122,10 @@ def encode_move(m: Move, user: Pokemon, opp: Pokemon):
     if m is None or user is None or opp is None:
         return [0] * 14
 
-    # Base Power
     bp_norm = min((m.base_power or 0) / 150, 1.0)
 
-    # STAB
     stab = 1 if m.type in {user.type_1, user.type_2} else 0
 
-    # Effectiveness
     try:
         eff_raw = m.type.damage_multiplier(opp.type_1, opp.type_2)
     except:
@@ -116,10 +134,7 @@ def encode_move(m: Move, user: Pokemon, opp: Pokemon):
     eff_norm = min(eff_raw / 4.0, 1.0)
     is_immune = 1 if eff_raw == 0 else 0
 
-    # Accuracy
     accuracy = (m.accuracy or 100) / 100
-
-    # Flags
     priority = 1 if m.priority > 0 else 0
     is_setup = 1 if m.id in SETUP_MOVES else 0
     is_status = 1 if m.category.name == "STATUS" else 0
@@ -128,18 +143,16 @@ def encode_move(m: Move, user: Pokemon, opp: Pokemon):
     pivot = 1 if m.id in PIVOT_MOVES else 0
     protect = 1 if m.id in PROTECT_MOVES else 0
 
-    # Failure prediction
     will_fail = 0
 
-    # Dragon → Fairy immune
     if m.type.name == "Dragon":
         if (opp.type_1 and opp.type_1.name == "Fairy") or \
            (opp.type_2 and opp.type_2.name == "Fairy"):
             will_fail = 1
 
-    # Wisp fails vs Fire or already statused
     if m.id == "willowisp":
-        if (opp.type_1 and opp.type_1.name == "Fire") or (opp.type_2 and opp.type_2.name == "Fire"):
+        if (opp.type_1 and opp.type_1.name == "Fire") or \
+           (opp.type_2 and opp.type_2.name == "Fire"):
             will_fail = 1
         if opp.status is not None:
             will_fail = 1
@@ -173,7 +186,7 @@ def boost_norm(p: Pokemon, stat):
 
 
 # ============================================================
-# BENCH ENCODING
+# BENCH
 # ============================================================
 def bench_list(team, active):
     bench = [p for p in team.values() if p is not active]
@@ -193,7 +206,6 @@ def encode_bench(team, active, opp):
         vec.append(speed_bucket(stats["spe"]))
         vec.extend(encode_moveset(p, opp))
 
-    # pad to 5 * 87 dims
     while len(vec) < 5 * 87:
         vec.extend([0] * 87)
 
@@ -249,7 +261,7 @@ def encode_state(battle):
     vec.extend(species_one_hot(opp))
     vec.extend(type_one_hot(opp))
 
-    # HP & speed
+    # HP & Speed
     vec.append(hp_fraction(my))
     vec.append(hp_bucket_10(my))
     vec.append(hp_fraction(opp))
@@ -258,6 +270,16 @@ def encode_state(battle):
     vec.append(speed_bucket(my_stats["spe"]))
     vec.append(speed_bucket(opp_stats["spe"]))
     vec.append(1 if my_stats["spe"] > opp_stats["spe"] else 0)
+
+    # --- NEW: STAT BUCKETS (ATK/DEF/SPA/SPD) ---
+    for stat in ["atk", "def", "spa", "spd","hp"]:
+        my_val = my_stats.get(stat, 0)
+        vec.append(stat_bucket(stat, my_val) / 3.0)
+
+    for stat in ["atk", "def", "spa", "spd", "hp"]:
+        opp_val = opp_stats.get(stat, 0)
+        vec.append(stat_bucket(stat, opp_val) / 3.0)
+
 
     # Movesets
     vec.extend(encode_moveset(my, opp))
@@ -276,7 +298,7 @@ def encode_state(battle):
     # Alive flags
     vec.extend(encode_alive_flags(battle))
 
-    # Turn
+    # Turn bucket
     vec.append(turn_bucket(battle.turn))
 
     return np.array(vec, dtype=np.float32)
