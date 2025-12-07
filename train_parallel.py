@@ -1,36 +1,50 @@
+# train_parallel.py
+
 import asyncio
 from collections import deque
 
-from poke_env.player.baselines import MaxBasePowerPlayer, SimpleHeuristicsPlayer
 from rl_agent import MyRLAgent
-
-from randomizer.team_generator import load_pool, generate_random_lead_team, generate_fixed_team
 from showdown_server import start_showdown_server
 
+from randomizer.team_generator import (
+    load_pool,
+    generate_fixed_team,
+)
+
+from fixed_ais import (
+    FixedOrderRandomPlayer,
+    FixedOrderMaxBasePower,
+    FixedOrderSimpleHeuristics,
+)
 
 # ============================================================
 # TRAINING CONSTANTS
 # ============================================================
 MINIBATCH = 50
 MAX_PARALLEL = 16
-MODEL_FOLDER = "models/a2c_v8"
+MODEL_FOLDER = "models/a2c_v10"
 
-ROLLING_WINDOW = 20   # number of minibatches for rolling winrate
+ROLLING_WINDOW = 20
 
-# Win-rate thresholds (rolling)
-PHASE1_THRESHOLD = 0.6   # empirically correct for moves-only phase
-PHASE2A_THRESHOLD = 0.65
-PHASE2B_THRESHOLD = 0.70  # mastery threshold (optional)
+# Phase thresholds
+WARMUP_THRESHOLD = 0.55
+PHASE1_THRESHOLD = 0.60
+PHASE2A_THRESHOLD = 0.67
+PHASE2B_THRESHOLD = 0.70  # mastery
 
-# Minimum batches before transitions
-MIN_BATCHES_PHASE1 = 12
-MIN_BATCHES_PHASE2A = 15
+# Minimum cycles per stage
+MIN_WARMUP_CYCLES = 4
+MIN_PHASE1_CYCLES = 12
+MIN_PHASE2A_CYCLES = 12
+
+# Allow resuming from anywhere
+START_PHASE = "warmup"   # "warmup" | "phase1" | "phase2a" | "phase2b"
 
 
 # ============================================================
-# ROLLING AVG HELPER
+# Helper: Rolling average window
 # ============================================================
-def compute_rolling_avg(values: deque):
+def rolling_avg(values: deque):
     return sum(values) / len(values) if values else 0.0
 
 
@@ -39,95 +53,125 @@ def compute_rolling_avg(values: deque):
 # ============================================================
 async def train_forever():
 
-    # ------------------------------------------
-    # Load pool + generate fixed teams
-    # ------------------------------------------
+    # ----------------------------------------------------------
+    # Load teams (fixed for both sides)
+    # ----------------------------------------------------------
     pool = load_pool("teams/team_pool.json")
     team_rl = generate_fixed_team(pool)
     team_ai = generate_fixed_team(pool)
 
     print("\n=== FIXED TRAINING TEAMS ===")
-    print(team_rl, "\n\n", team_ai)
-    print("======================================\n")
+    print("RL Team:\n", team_rl)
+    print("AI Team:\n", team_ai)
+    print("====================================\n")
 
-    # ------------------------------------------
-    # Create RL agent — PHASE 1 SETTINGS
-    # ------------------------------------------
+    # ----------------------------------------------------------
+    # Instantiate RL agent
+    # allow_switching will be configured per phase
+    # ----------------------------------------------------------
     rl_agent = MyRLAgent(
         battle_format="gen9ubers",
-        model_folder=MODEL_FOLDER,
         max_concurrent_battles=MAX_PARALLEL,
         team=team_rl,
-
-        # PHASE 1 = moves only
-        allow_switching=False,
-        use_expert_switching=True,
+        model_folder=MODEL_FOLDER,
     )
 
-    # Phase 1 opponent
-    ai_agent = MaxBasePowerPlayer(
-        battle_format="gen9ubers",
-        max_concurrent_battles=MAX_PARALLEL,
-        team=team_ai,
-    )
+    # ----------------------------------------------------------
+    # Curriculum setup
+    # ----------------------------------------------------------
+    phase = START_PHASE.lower()
 
-    phase = "PHASE1"
-    rolling_winrates = deque(maxlen=ROLLING_WINDOW)
+    if phase == "warmup":
+        ai_agent = FixedOrderRandomPlayer(
+            battle_format="gen9ubers",
+            max_concurrent_battles=MAX_PARALLEL,
+            team=team_ai,
+        )
+        rl_agent.allow_switching = False
+        rl_agent.use_expert_switching = False
+
+    elif phase == "phase1":
+        ai_agent = FixedOrderMaxBasePower(
+            battle_format="gen9ubers",
+            max_concurrent_battles=MAX_PARALLEL,
+            team=team_ai,
+        )
+        rl_agent.allow_switching = False
+        rl_agent.use_expert_switching = False
+
+    elif phase == "phase2a":
+        ai_agent = FixedOrderMaxBasePower(
+            battle_format="gen9ubers",
+            max_concurrent_battles=MAX_PARALLEL,
+            team=team_ai,
+        )
+        rl_agent.allow_switching = True
+        rl_agent.use_expert_switching = True
+
+    elif phase == "phase2b":
+        ai_agent = FixedOrderSimpleHeuristics(
+            battle_format="gen9ubers",
+            max_concurrent_battles=MAX_PARALLEL,
+            team=team_ai,
+        )
+        rl_agent.allow_switching = True
+        rl_agent.use_expert_switching = False
+
+    else:
+        raise ValueError(f"Invalid START_PHASE: {START_PHASE}")
+
+    print(f"\n===== STARTING TRAINING AT PHASE: {phase.upper()} =====\n")
+
+    # ----------------------------------------------------------
+    # Rolling performance window
+    # ----------------------------------------------------------
+    winrates = deque(maxlen=ROLLING_WINDOW)
     cycle = 0
 
-    print("===== START TRAINING: PHASE 1 (Moves Only) =====\n")
-
     # ============================================================
-    # Infinite curriculum loop
+    # MAIN TRAINING LOOP
     # ============================================================
     while True:
         cycle += 1
         print(f"\n========== MINIBATCH {cycle} ({MINIBATCH} battles) ==========")
 
-        # ----------------------------------------------------------
-        # Run battles
-        # ----------------------------------------------------------
         prev_finished = rl_agent.n_finished_battles
         prev_wins = rl_agent.n_won_battles
 
         await rl_agent.battle_against(ai_agent, n_battles=MINIBATCH)
 
-        # Batch stats
+        # Stats
         batch_finished = rl_agent.n_finished_battles - prev_finished
         batch_wins = rl_agent.n_won_battles - prev_wins
-        batch_winrate = (batch_wins / batch_finished) if batch_finished > 0 else 0.0
+        batch_winrate = batch_wins / batch_finished if batch_finished > 0 else 0
 
-        # Rolling avg update
-        rolling_winrates.append(batch_winrate)
-        rolling_avg = compute_rolling_avg(rolling_winrates)
+        winrates.append(batch_winrate)
+        r_avg = rolling_avg(winrates)
 
-        # Lifetime stats
-        lifetime_finished = rl_agent.n_finished_battles
-        lifetime_wins = rl_agent.n_won_battles
-        lifetime_winrate = (
-            lifetime_wins / lifetime_finished if lifetime_finished else 0.0
-        )
-
-        # ----------------------------------------------------------
-        # Pretty console reporting
-        # ----------------------------------------------------------
-        print(f"\n[{phase}] ======== RESULTS FOR BATCH {cycle} ========")
         print(
-            f"[{phase}] Batch:    {batch_wins}/{batch_finished} "
+            f"[{phase}] Batch {cycle}: {batch_wins}/{batch_finished} "
             f"({batch_winrate*100:.1f}%)"
         )
+
+        # --- Lifetime stats ---
+        lifetime_finished = rl_agent.n_finished_battles
+        lifetime_wins = rl_agent.n_won_battles
+
+        if lifetime_finished > 0:
+            lifetime_winrate = lifetime_wins / lifetime_finished
+        else:
+            lifetime_winrate = 0.0
+
         print(
             f"[{phase}] Lifetime: {lifetime_wins}/{lifetime_finished} "
             f"({lifetime_winrate*100:.1f}%)"
         )
+
         print(
-            f"[{phase}] Rolling ({len(rolling_winrates)}/{ROLLING_WINDOW}): "
-            f"{rolling_avg*100:.1f}%"
+            f"[{phase}] Rolling ({len(winrates)}): {r_avg*100:.1f}%"
         )
 
-        # ----------------------------------------------------------
-        # Training
-        # ----------------------------------------------------------
+        # Train neural net updates
         if rl_agent.episode_buffer:
             rl_agent._process_episodes()
 
@@ -136,68 +180,93 @@ async def train_forever():
 
         rl_agent.save_model()
 
-        # ============================================================
-        # PHASE TRANSITIONS
-        # ============================================================
+        # ========================================================
+        # Phase Transitions
+        # ========================================================
 
-        # ------------------------------
+        # -----------------------
+        # Warmup → Phase 1
+        # -----------------------
+        if (
+            phase == "warmup"
+            and cycle >= MIN_WARMUP_CYCLES
+            and r_avg >= WARMUP_THRESHOLD
+        ):
+            print("\n=== ADVANCING TO PHASE 1: Moves Only vs MaxBasePower ===\n")
+
+            phase = "phase1"
+            winrates.clear()
+
+            rl_agent.allow_switching = False
+            rl_agent.use_expert_switching = False
+
+            ai_agent = FixedOrderMaxBasePower(
+                battle_format="gen9ubers",
+                max_concurrent_battles=MAX_PARALLEL,
+                team=team_ai,
+            )
+            continue
+
+        # -----------------------
         # Phase 1 → Phase 2A
-        # ------------------------------
+        # -----------------------
         if (
-            phase == "PHASE1"
-            and cycle >= MIN_BATCHES_PHASE1
-            and rolling_avg >= PHASE1_THRESHOLD
+            phase == "phase1"
+            and cycle >= MIN_PHASE1_CYCLES
+            and r_avg >= PHASE1_THRESHOLD
         ):
-            print("\n=== ADVANCING TO PHASE 2A (Switching vs MaxDamage) ===\n")
+            print("\n=== ADVANCING TO PHASE 2A: Switching + Expert Guidance ===\n")
 
-            phase = "PHASE2A"
+            phase = "phase2a"
+            winrates.clear()
+
             rl_agent.allow_switching = True
-            rl_agent.use_expert_switching = True  # enable expert guidance
-            rl_agent.epsilon = rl_agent.epsilon_start
-            rolling_winrates.clear()
+            rl_agent.use_expert_switching = True
 
-            ai_agent = MaxBasePowerPlayer(
+            ai_agent = FixedOrderMaxBasePower(
                 battle_format="gen9ubers",
                 max_concurrent_battles=MAX_PARALLEL,
                 team=team_ai,
             )
             continue
 
-        # ------------------------------
+        # -----------------------
         # Phase 2A → Phase 2B
-        # ------------------------------
+        # -----------------------
         if (
-            phase == "PHASE2A"
-            and cycle >= MIN_BATCHES_PHASE2A
-            and rolling_avg >= PHASE2A_THRESHOLD
+            phase == "phase2a"
+            and cycle >= MIN_PHASE2A_CYCLES
+            and r_avg >= PHASE2A_THRESHOLD
         ):
-            print("\n=== ADVANCING TO PHASE 2B (Switching vs SimpleHeuristics AI) ===\n")
+            print("\n=== ADVANCING TO PHASE 2B: vs SimpleHeuristics ===\n")
 
-            phase = "PHASE2B"
-            rl_agent.epsilon = rl_agent.epsilon_start
-            rolling_winrates.clear()
+            phase = "phase2b"
+            winrates.clear()
 
-            ai_agent = SimpleHeuristicsPlayer(
+            rl_agent.allow_switching = True
+            rl_agent.use_expert_switching = False
+
+            ai_agent = FixedOrderSimpleHeuristics(
                 battle_format="gen9ubers",
                 max_concurrent_battles=MAX_PARALLEL,
                 team=team_ai,
             )
             continue
 
-        # ------------------------------
-        # Optional mastery message
-        # ------------------------------
-        if phase == "PHASE2B" and rolling_avg >= PHASE2B_THRESHOLD:
+        # -----------------------
+        # Optional Mastery
+        # -----------------------
+        if phase == "phase2b" and r_avg >= PHASE2B_THRESHOLD:
             print("\n=== RL AGENT HAS MASTERED THE CURRICULUM! ===\n")
 
 
 # ============================================================
-# ENTRY POINT
+# Entry Point
 # ============================================================
 if __name__ == "__main__":
     server_proc = start_showdown_server()
     try:
         asyncio.run(train_forever())
     finally:
-        print("\nShutting down Showdown server...")
+        print("\nShutting down Pokémon Showdown server...")
         server_proc.terminate()

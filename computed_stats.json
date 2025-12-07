@@ -1,0 +1,50 @@
+{
+  "dragapult": {
+    "atk": 245,
+    "def": 186,
+    "spa": 299,
+    "spd": 187,
+    "spe": 383,
+    "hp": 317
+  },
+  "gholdengo": {
+    "atk": 125,
+    "def": 226,
+    "spa": 365,
+    "spd": 219,
+    "spe": 267,
+    "hp": 315
+  },
+  "kingambit": {
+    "atk": 306,
+    "def": 276,
+    "spa": 156,
+    "spd": 269,
+    "spe": 137,
+    "hp": 404
+  },
+  "ironvaliant": {
+    "atk": 265,
+    "def": 216,
+    "spa": 339,
+    "spd": 157,
+    "spe": 331,
+    "hp": 289
+  },
+  "weavile": {
+    "atk": 339,
+    "def": 166,
+    "spa": 126,
+    "spd": 207,
+    "spe": 349,
+    "hp": 281
+  },
+  "skeledirge": {
+    "atk": 155,
+    "def": 299,
+    "spa": 257,
+    "spd": 186,
+    "spe": 168,
+    "hp": 412
+  }
+}

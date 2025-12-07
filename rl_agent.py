@@ -139,10 +139,15 @@ class MyRLAgent(Player):
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         print(f"[RL] Model created (state_size={state_size})")
 
+    def teampreview(self, battle):
+        return "/team 213456"
     # ============================================================
     # MODEL LOAD / SAVE
     # ============================================================
-
+    def choose_team(self, battle):
+        # Always pick the given team order: Dragapult lead
+        return "/team 213456"
+    
     def _try_load_model(self):
         ckpt_path = os.path.join(self.model_folder, "checkpoint.pth")
         if not os.path.exists(ckpt_path):
