@@ -217,11 +217,18 @@ class RewardCalculator:
         # --------------------------------------------------
         # BOOSTS
         # --------------------------------------------------
-        for stat in ("atk","spa"):
-            if my.boosts.get(stat,0) > self.prev_my_boosts.get(stat,0):
+        # BOOSTS (all major stats)
+        boost_stats = ("atk", "def", "spa", "spd", "spe")
+
+        for stat in boost_stats:
+            # My boosts gained → reward
+            if my.boosts.get(stat, 0) > self.prev_my_boosts.get(stat, 0):
                 reward += self.boost_reward
-            if opp.boosts.get(stat,0) > self.prev_opp_boosts.get(stat,0):
+
+            # Opponent boosts gained → penalty
+            if opp.boosts.get(stat, 0) > self.prev_opp_boosts.get(stat, 0):
                 reward -= self.boost_penalty
+
 
         # Suicide boosting penalty
         if my_fainted > self.prev_my_fainted and last_used_move and last_used_move.category.name == "STATUS":
@@ -243,6 +250,28 @@ class RewardCalculator:
                 reward += self.matchup_reward
             elif delta < -0.1:
                 reward -= self.matchup_penalty
+                # --- NEW: Punish switching out when you have boosts ---
+            boost_stats = ("atk", "def", "spa", "spd", "spe")
+
+            # Count only positive boosts (switching wastes them)
+            total_positive_boosts = sum(
+                max(0, my.boosts.get(stat, 0)) for stat in boost_stats
+            )
+
+            if total_positive_boosts > 0:
+                # Scaled penalty: each boost level increases punishment
+                reward -= self.boost_penalty * total_positive_boosts
+            # --- NEW: Reward switching out when significantly debuffed ---
+            debuff_stats = ("atk", "def", "spa", "spd", "spe")
+
+            total_debuff = sum(
+                abs(min(0, my.boosts.get(stat, 0)))
+                for stat in debuff_stats
+            )
+
+            if total_debuff > 0:
+                reward += self.matchup_reward * total_debuff
+
 
             # Speed advantage bonus
             my_spe = get_real_stats(my.species)["spe"]

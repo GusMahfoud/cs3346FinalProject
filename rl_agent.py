@@ -73,7 +73,8 @@ class MyRLAgent(Player):
         value_coef=0.5,
         batch_size=256,
         allow_switching=False,       # phase 1: moves only
-        use_expert_switching=False,  # when True, use SwitchHeuristics
+        use_expert_switching=False, 
+        rl_switch_enabled=False, # when True, use SwitchHeuristics
         expert_imitation_bonus=3.0,
         model_folder=None,
         **kwargs
@@ -188,7 +189,7 @@ class MyRLAgent(Player):
         legal = []
 
         # ----------------------------------------------------------
-        # If Pokémon is fainted or missing → forced switching only
+        # 1. FORCED SWITCH (KO, Roar, Encore lock, etc.)
         # ----------------------------------------------------------
         if (
             battle.active_pokemon is None
@@ -201,19 +202,17 @@ class MyRLAgent(Player):
             return legal  # ONLY switches allowed
 
         # ----------------------------------------------------------
-        # PHASE 1 — MOVES ONLY (no manual switching, no pivot moves)
+        # 2. SWITCHING DISABLED (Phase 1)
+        #    RL may use pivot moves, but NOT manual switching
         # ----------------------------------------------------------
         if not self.allow_switching:
             for i, m in enumerate(battle.available_moves):
                 if m is None or i >= 4:
                     continue
-                # Block pivot moves (U-turn, Volt Switch, Flip Turn, Parting Shot)
-                if m.id in PIVOT_MOVES:
-                    continue
+                # IMPORTANT: pivot moves are allowed
                 legal.append(i)
 
-            # If no legal moves (e.g. all PP stalled, Encore corner cases),
-            # allow forced switch as a fallback.
+            # If no attacking moves: fallback to forced switching
             if len(legal) == 0:
                 for i, p in enumerate(battle.available_switches):
                     if p is not None:
@@ -222,7 +221,22 @@ class MyRLAgent(Player):
             return legal
 
         # ----------------------------------------------------------
-        # PHASE 2 — FULL ACTION SET (moves + switches, pivot allowed)
+        # 3. SWITCHING ENABLED,
+        #    BUT RL IS NOT ALLOWED TO CHOOSE SWITCHES (Phase 2A)
+        #    Expert switching still works separately
+        # ----------------------------------------------------------
+        if self.allow_switching and not self.rl_switch_enabled:
+            # RL can ONLY choose moves (including pivots)
+            for i, m in enumerate(battle.available_moves):
+                if m is not None and i < 4:
+                    legal.append(i)
+
+            # DO NOT expose switch actions to RL
+            return legal
+
+        # ----------------------------------------------------------
+        # 4. FULL ACTION SET (Phase 2B / 3)
+        #    RL AND expert both may switch
         # ----------------------------------------------------------
         # Moves 0–3
         for i, m in enumerate(battle.available_moves):
@@ -235,6 +249,7 @@ class MyRLAgent(Player):
                 legal.append(SWITCH_OFFSET + i)
 
         return legal
+
 
     # ============================================================
     # ACTION → MOVE (RECURSION-SAFE, WITH EXPERT OVERRIDE)

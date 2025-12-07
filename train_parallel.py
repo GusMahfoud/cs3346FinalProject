@@ -22,19 +22,19 @@ from fixed_ais import (
 # ============================================================
 MINIBATCH = 50
 MAX_PARALLEL = 16
-MODEL_FOLDER = "models/a2c_v10"
+MODEL_FOLDER = "models/a2c_v12"
 
 ROLLING_WINDOW = 20
 
 # Phase thresholds
 WARMUP_THRESHOLD = 0.55
-PHASE1_THRESHOLD = 0.60
+PHASE1_THRESHOLD = 0.57
 PHASE2A_THRESHOLD = 0.67
 PHASE2B_THRESHOLD = 0.70  # mastery
 
 # Minimum cycles per stage
 MIN_WARMUP_CYCLES = 4
-MIN_PHASE1_CYCLES = 12
+MIN_PHASE1_CYCLES = 50
 MIN_PHASE2A_CYCLES = 12
 
 # Allow resuming from anywhere
@@ -105,7 +105,7 @@ async def train_forever():
             max_concurrent_battles=MAX_PARALLEL,
             team=team_ai,
         )
-        rl_agent.allow_switching = True
+        rl_agent.allow_switching = False
         rl_agent.use_expert_switching = True
 
     elif phase == "phase2b":
@@ -189,6 +189,7 @@ async def train_forever():
         # -----------------------
         if (
             phase == "warmup"
+            and START_PHASE == "warmup"
             and cycle >= MIN_WARMUP_CYCLES
             and r_avg >= WARMUP_THRESHOLD
         ):
