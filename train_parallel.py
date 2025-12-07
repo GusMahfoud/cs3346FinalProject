@@ -22,7 +22,7 @@ from fixed_ais import (
 # ============================================================
 MINIBATCH = 50
 MAX_PARALLEL = 16
-MODEL_FOLDER = "models/a2c_v14"
+MODEL_FOLDER = "models/a2c_v15"
 
 ROLLING_WINDOW = 20
 
@@ -38,7 +38,7 @@ MIN_PHASE1_CYCLES = 50
 MIN_PHASE2A_CYCLES = 50
 
 # Allow resuming from anywhere
-START_PHASE = "phase2a"   # "warmup" | "phase1" | "phase2a" | "phase2b"
+START_PHASE = "warmup"   # "warmup" | "phase1" | "phase2a" | "phase2b"
 
 
 # ============================================================

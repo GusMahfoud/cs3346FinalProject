@@ -106,6 +106,8 @@ class MyRLAgent(Player):
 
         # Reward engine
         self.reward_calc = RewardCalculator()
+        self.prev_turn = None
+
 
         # Buffers
         self.prev_battle_state = None
@@ -353,30 +355,31 @@ class MyRLAgent(Player):
 
     def choose_move(self, battle):
         # --------------------------------------------------------
-        # 1. Assign reward for previous transition (s, a, r)
+        # 1. PROCESS REWARD FOR LAST TURN
         # --------------------------------------------------------
-        if self.prev_battle_state is not None and not battle.finished:
-            # Base environment reward from RewardCalculator
-            r = self.reward_calc.compute_turn_reward(
-                self.prev_battle_state,
-                battle,
-                action_was_switch=self.last_action_was_switch,
-            )
+        current_turn = battle.turn
 
-            # Expert imitation bonus:
-            # If last action was a switch and expert ALSO wanted a switch
-            if self.use_expert_switching:
-                try:
-                    if self.last_action_was_switch:
-                        if self.switch_expert.should_switch_out(self.prev_battle_state):
-                            r += self.expert_imitation_bonus
-                except Exception:
-                    # Fail safe: do not break training if heuristic errors
-                    pass
+        # If we have previous state AND turn changed, flush accumulated reward
+        if self.prev_battle_state is not None and self.prev_turn is not None:
+            if current_turn != self.prev_turn:
+                # flush reward for previous turn
+                r = self.reward_calc.flush()
 
-            if self.battle_history:
-                s, a, _ = self.battle_history[-1]
-                self.battle_history[-1] = (s, a, r)
+                # assign reward to last (s,a)
+                if self.battle_history:
+                    s, a, old = self.battle_history[-1]
+                    self.battle_history[-1] = (s, a, old + r)
+
+        # Always update prev_turn
+        self.prev_turn = current_turn
+
+        # Continue gathering reward data for new events in this turn
+        self.reward_calc.compute_turn_reward(
+            self.prev_battle_state,
+            battle,
+            action_was_switch=self.last_action_was_switch,
+)
+
 
         # --------------------------------------------------------
         # 2. Encode current state
@@ -474,11 +477,12 @@ class MyRLAgent(Player):
     def on_battle_end(self, battle):
         # Final intermediate reward
         if self.prev_battle_state is not None and self.battle_history:
-            r = self.reward_calc.compute_turn_reward(
-                self.prev_battle_state,
-                battle,
-                action_was_switch=self.last_action_was_switch,
-            )
+            # Flush any leftover turn reward
+            r = self.reward_calc.flush()
+            if self.battle_history:
+                s, a, old = self.battle_history[-1]
+                self.battle_history[-1] = (s, a, old + r)
+
 
             if self.use_expert_switching:
                 try:

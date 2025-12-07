@@ -122,7 +122,22 @@ class RewardCalculator:
 
         self.prev_matchup_score = None
 
+        self.turn_reward = 0.0
 
+    # ------------------------------------------------------
+    # Add small reward to accumulator
+    # ------------------------------------------------------
+    def add(self, value: float):
+        self.turn_reward += value
+
+
+    # ------------------------------------------------------
+    # Flush reward at end of turn
+    # ------------------------------------------------------
+    def flush(self):
+        r = self.turn_reward
+        self.turn_reward = 0.0
+        return r
     # ------------------------------------------------------
     def matchup_score(self, my, opp):
         my_types = my.types or []
@@ -339,4 +354,6 @@ class RewardCalculator:
         self.prev_matchup_score = new_matchup
         self.last_active_species = my.species
 
-        return reward
+        self.add(reward)
+        return 0.0
+
