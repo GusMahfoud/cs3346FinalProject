@@ -41,29 +41,29 @@ class RewardCalculator:
         self,
         # terminal
         terminal_win=100,
-        terminal_loss=-100,
+        terminal_loss=-120,
         terminal_draw=0,
 
         # hp buckets
         hp_bucket_reward=4,
-        hp_bucket_penalty=4,
+        hp_bucket_penalty=6,
 
         # ko/faint
         ko_reward=30,
-        faint_penalty=25,
+        faint_penalty=35,
 
         # status
         status_reward=4,
-        status_penalty=4,
+        status_penalty=6,
 
         # boosts
         boost_reward=6,
-        boost_penalty=6,
+        boost_penalty=8,
 
         # switching
-        base_switch_penalty=0.5,
-        switch_chain_penalty=1.5,
-        switch_spam_penalty=2.0,
+        base_switch_penalty=1,
+        switch_chain_penalty=2.5,
+        switch_spam_penalty=3.0,
         switch_window=6,
 
         # matchup switching

@@ -7,6 +7,7 @@ import torch.optim as optim
 import os
 from torch.utils.tensorboard import SummaryWriter
 
+from advanced_switcher import SwitchHeuristics
 from rewards import RewardCalculator
 from state_encoder import encode_state
 
@@ -21,7 +22,7 @@ MOVE_ACTIONS = [0, 1, 2, 3]
 SWITCH_OFFSET = 4
 
 # Pivot moves that cause switching on hit
-PIVOT_MOVES = {"uturn", "voltturn", "flipturn", "partingshot"}
+PIVOT_MOVES = {"uturn", "voltswitch", "flipturn", "partingshot"}
 
 
 # ============================================================
@@ -36,6 +37,15 @@ class ActorCriticNet(nn.Module):
         self.policy = nn.Linear(hidden_size, action_size)
         self.value = nn.Linear(hidden_size, 1)
         self.relu = nn.ReLU()
+
+        # Small init to avoid huge logits at start
+        nn.init.orthogonal_(self.fc1.weight, gain=np.sqrt(2))
+        nn.init.orthogonal_(self.fc2.weight, gain=np.sqrt(2))
+        nn.init.orthogonal_(self.policy.weight, gain=0.01)
+        nn.init.constant_(self.fc1.bias, 0.0)
+        nn.init.constant_(self.fc2.bias, 0.0)
+        nn.init.constant_(self.policy.bias, 0.0)
+        nn.init.constant_(self.value.bias, 0.0)
 
     def forward(self, x):
         x = self.relu(self.fc1(x))
@@ -55,14 +65,16 @@ class MyRLAgent(Player):
         self,
         battle_format="gen9ubers",
         gamma=0.995,
-        lr=1.5e-4,
+        lr=1e-3,
         epsilon_start=1.0,
         epsilon_end=0.05,
-        epsilon_decay=0.992,
+        epsilon_decay=0.998,
         entropy_coef=0.05,
         value_coef=0.5,
         batch_size=256,
-        allow_switching=False,            # phase 1 default
+        allow_switching=False,       # phase 1: moves only
+        use_expert_switching=False,  # when True, use SwitchHeuristics
+        expert_imitation_bonus=3.0,
         model_folder=None,
         **kwargs
     ):
@@ -84,17 +96,20 @@ class MyRLAgent(Player):
         self.epsilon_end = epsilon_end
         self.epsilon_decay = epsilon_decay
 
-        # Phase control (Phase 1: moves only)
+        # Switching / expert control
         self.allow_switching = allow_switching
+        self.use_expert_switching = use_expert_switching
+        self.expert_imitation_bonus = expert_imitation_bonus
+        self.switch_expert = SwitchHeuristics()
 
         # Reward engine
         self.reward_calc = RewardCalculator()
 
         # Buffers
         self.prev_battle_state = None
-        self.battle_history = []
-        self.episode_buffer = []
-        self.experience_buffer = []
+        self.battle_history = []      # list of (state_vec, action, reward)
+        self.episode_buffer = []      # list of episodes
+        self.experience_buffer = []   # flattened (s, a, R)
 
         # Model info
         self.model = None
@@ -187,7 +202,7 @@ class MyRLAgent(Player):
             for i, m in enumerate(battle.available_moves):
                 if m is None or i >= 4:
                     continue
-                # Block pivot moves (U-turn, VoltTurn, FlipTurn, Parting Shot)
+                # Block pivot moves (U-turn, Volt Switch, Flip Turn, Parting Shot)
                 if m.id in PIVOT_MOVES:
                     continue
                 legal.append(i)
@@ -217,7 +232,7 @@ class MyRLAgent(Player):
         return legal
 
     # ============================================================
-    # ACTION → MOVE (RECURSION-SAFE)
+    # ACTION → MOVE (RECURSION-SAFE, WITH EXPERT OVERRIDE)
     # ============================================================
 
     def action_to_move(self, action, battle):
@@ -247,16 +262,29 @@ class MyRLAgent(Player):
         # SWITCH ACTION (4+)
         # -----------------------------
         if action >= SWITCH_OFFSET:
-            idx = action - SWITCH_OFFSET
             switches = battle.available_switches
 
+            # If expert switching is enabled, always switch into best heuristic target
+            if self.allow_switching and self.use_expert_switching and switches:
+                try:
+                    best_mon = self.switch_expert.best_switch_target(battle)
+                except Exception:
+                    best_mon = None
+
+                if best_mon is not None:
+                    self.last_action_priority = False
+                    self.last_action_was_switch = True
+                    return self.create_order(best_mon)
+
+            # Otherwise, respect the index when possible
+            idx = action - SWITCH_OFFSET
             if idx < len(switches) and switches[idx] is not None:
                 self.last_action_priority = False
                 self.last_action_was_switch = True
                 return self.create_order(switches[idx])
 
             # Fallback: pick first valid switch
-            for i, p in enumerate(switches):
+            for p in switches:
                 if p is not None:
                     self.last_action_priority = False
                     self.last_action_was_switch = True
@@ -303,19 +331,35 @@ class MyRLAgent(Player):
     # ============================================================
 
     def choose_move(self, battle):
-
-        # Reward from previous state
+        # --------------------------------------------------------
+        # 1. Assign reward for previous transition (s, a, r)
+        # --------------------------------------------------------
         if self.prev_battle_state is not None and not battle.finished:
+            # Base environment reward from RewardCalculator
             r = self.reward_calc.compute_turn_reward(
                 self.prev_battle_state,
                 battle,
                 action_was_switch=self.last_action_was_switch,
             )
+
+            # Expert imitation bonus:
+            # If last action was a switch and expert ALSO wanted a switch
+            if self.use_expert_switching:
+                try:
+                    if self.last_action_was_switch:
+                        if self.switch_expert.should_switch_out(self.prev_battle_state):
+                            r += self.expert_imitation_bonus
+                except Exception:
+                    # Fail safe: do not break training if heuristic errors
+                    pass
+
             if self.battle_history:
                 s, a, _ = self.battle_history[-1]
                 self.battle_history[-1] = (s, a, r)
 
-        # Encode state
+        # --------------------------------------------------------
+        # 2. Encode current state
+        # --------------------------------------------------------
         state_vec = encode_state(battle).astype(np.float32)
         if self.model is None:
             self._init_model(len(state_vec))
@@ -326,21 +370,60 @@ class MyRLAgent(Player):
         if not legal:
             move = self.choose_random_legal_action(battle)
             self.prev_battle_state = battle
+            # store dummy action 0, reward 0
             self.battle_history.append((state_vec.copy(), 0, 0.0))
             return move
 
-        # Epsilon-greedy
+        # --------------------------------------------------------
+        # 3. Expert override BEFORE RL sampling (optional)
+        #    If expert strongly says "switch out now", we obey.
+        # --------------------------------------------------------
+        if (
+            self.allow_switching
+            and self.use_expert_switching
+            and battle.available_switches
+        ):
+            try:
+                if self.switch_expert.should_switch_out(battle):
+                    best_mon = self.switch_expert.best_switch_target(battle)
+                else:
+                    best_mon = None
+            except Exception:
+                best_mon = None
+
+            if best_mon is not None:
+                # Determine a consistent action index to record
+                try:
+                    idx = battle.available_switches.index(best_mon)
+                    action = SWITCH_OFFSET + idx
+                except ValueError:
+                    # If somehow not in available_switches list, just pick first
+                    action = SWITCH_OFFSET
+
+                self.last_action_was_switch = True
+                self.last_action_priority = False
+
+                move = self.create_order(best_mon)
+                self.battle_history.append((state_vec.copy(), action, 0.0))
+                self.prev_battle_state = battle
+                return move
+
+        # --------------------------------------------------------
+        # 4. RL policy: epsilon-greedy over legal actions
+        # --------------------------------------------------------
         if np.random.random() < self.epsilon:
+            # Exploration
             action = np.random.choice(legal)
             move = self.action_to_move(action, battle)
-
         else:
+            # Policy sampling
             st = torch.FloatTensor(state_vec).unsqueeze(0)
             self.model.eval()
             with torch.no_grad():
                 logits, _ = self.model(st)
                 probs = torch.softmax(logits, dim=1).squeeze().numpy()
 
+            # Mask illegal actions
             mask = np.zeros_like(probs)
             mask[legal] = probs[legal]
 
@@ -348,6 +431,7 @@ class MyRLAgent(Player):
                 action = np.random.choice(legal)
             else:
                 mask /= mask.sum()
+                # Small temperature to avoid over-confident early picks
                 temperature = max(0.3, self.epsilon)
                 dist = mask ** (1 / temperature)
                 dist /= dist.sum()
@@ -355,9 +439,7 @@ class MyRLAgent(Player):
 
             move = self.action_to_move(action, battle)
 
-        # Mark switch usage based on action index (forced or manual)
-        self.last_action_was_switch = (action >= SWITCH_OFFSET)
-
+        # NOTE: last_action_was_switch is set inside action_to_move.
         # Store transition
         self.battle_history.append((state_vec.copy(), action, 0.0))
         self.prev_battle_state = battle
@@ -369,7 +451,6 @@ class MyRLAgent(Player):
     # ============================================================
 
     def on_battle_end(self, battle):
-
         # Final intermediate reward
         if self.prev_battle_state is not None and self.battle_history:
             r = self.reward_calc.compute_turn_reward(
@@ -377,11 +458,20 @@ class MyRLAgent(Player):
                 battle,
                 action_was_switch=self.last_action_was_switch,
             )
+
+            if self.use_expert_switching:
+                try:
+                    if self.last_action_was_switch:
+                        if self.switch_expert.should_switch_out(self.prev_battle_state):
+                            r += self.expert_imitation_bonus
+                except Exception:
+                    pass
+
             s, a, old = self.battle_history[-1]
             self.battle_history[-1] = (s, a, old + r)
 
         # Terminal reward
-        terminal = self.reward_calc.terminal_reward(battle)
+        terminal = self.reward_calc.compute_terminal_reward(battle)
         if self.battle_history:
             s, a, old = self.battle_history[-1]
             self.battle_history[-1] = (s, a, old + terminal)
@@ -478,5 +568,6 @@ class MyRLAgent(Player):
             f"value={value_loss.item():.4f} "
             f"entropy={entropy.item():.4f} "
             f"eps={self.epsilon:.3f} "
-            f"switching={'ON' if self.allow_switching else 'OFF'}"
+            f"switching={'ON' if self.allow_switching else 'OFF'} "
+            f"expert={'ON' if self.use_expert_switching else 'OFF'}"
         )
