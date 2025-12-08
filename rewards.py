@@ -1,9 +1,9 @@
-# rewards.py  (FULLY PATCHED WITH DIMINISHING BOOST REWARDS)
-
+# rewards.py — FINAL VERSION WITH DANGER & THREAT SHAPING
 import numpy as np
 from poke_env.data import GenData
 from computed_stats import get_real_stats
 from advanced_switcher import SwitchHeuristics
+from state_encoder import estimate_damage, danger_score, kill_threat_score
 
 GEN9_DATA = GenData.from_gen(9)
 TYPE_CHART = GEN9_DATA.type_chart
@@ -15,14 +15,16 @@ PIVOT_MOVES = {"uturn", "voltswitch", "flipturn", "partingshot", "batonpass"}
 # HP BUCKET
 # ------------------------------------------------------------
 def hp_bucket(frac):
-    if frac <= 0.25: return 0
-    if frac <= 0.50: return 1
-    if frac <= 0.75: return 2
-    return 3
+    """
+    10 buckets from 0 → 9.
+    Each bucket = 10% HP.
+    """
+    frac = max(0.0, min(1.0, frac))
+    return int(frac * 10)   # 0–9
 
 
 # ------------------------------------------------------------
-# DAMAGE-STAGE MULTIPLIERS (actual Pokémon mechanics)
+# BOOST DIMINISHING RETURNS
 # ------------------------------------------------------------
 def stage_multiplier(stage):
     stage = max(-6, min(6, stage))
@@ -33,28 +35,20 @@ def stage_multiplier(stage):
     }
     return mults[stage]
 
-
 def diminishing_boost_value(stage, base=8):
-    """
-    Diminishing returns curve for boosting:
-    +1 → moderate, +2 → strong, +3-6 → flattening
-    """
     if stage <= 0:
         return 0
     mult = stage_multiplier(stage)
-    return base * np.log2(mult)   # log scaling = diminishing returns
+    return base * np.log2(mult)
 
 
-# ------------------------------------------------------------
-# BOOSTING MOVE CATEGORIES
-# ------------------------------------------------------------
 BOOSTING_MOVES = {"swordsdance", "nastyplot", "quiverdance", "calmmind", "torchsong"}
 UTILITY_MOVES = {"willowisp", "recover", "slackoff"}
 
 
-# ------------------------------------------------------------
+# ===========================================================
 # REWARD CALCULATOR
-# ------------------------------------------------------------
+# ===========================================================
 class RewardCalculator:
 
     def __init__(
@@ -72,7 +66,7 @@ class RewardCalculator:
         status_reward=4,
         status_penalty=6,
 
-        boost_base=8,   # controls how strong boosts are globally
+        boost_base=8,
 
         suicide_boost_penalty=15,
 
@@ -86,6 +80,11 @@ class RewardCalculator:
 
         pivot_reward=3.0,
         turn_penalty=0.05,
+
+        # NEW DANGER/THREAT REWARD WEIGHTS
+        danger_penalty=12.0,
+        kill_threat_bonus=10.0,
+        danger_reduction_bonus=8.0,
     ):
 
         self.terminal_win = terminal_win
@@ -115,13 +114,16 @@ class RewardCalculator:
         self.pivot_reward = pivot_reward
         self.turn_penalty = turn_penalty
 
+        # NEW danger/threat weights
+        self.danger_penalty = danger_penalty
+        self.kill_threat_bonus = kill_threat_bonus
+        self.danger_reduction_bonus = danger_reduction_bonus
+
         self.heuristic = SwitchHeuristics()
 
         self.reset()
 
 
-    # ============================================================
-    # RESET
     # ============================================================
     def reset(self):
         self.prev_my_bucket = None
@@ -140,6 +142,9 @@ class RewardCalculator:
         self.last_switch_species = None
         self.last_active_species = None
 
+        self.prev_danger = 0
+        self.prev_kill_threat = 0
+
         self.consecutive_switches = 0
         self.recent_switches = []
 
@@ -151,8 +156,6 @@ class RewardCalculator:
 
 
     # ============================================================
-    # SWITCH MATCHUP SCORE
-    # ============================================================
     def compute_switch_heuristic_score(self, battle):
         a = battle.active_pokemon
         o = battle.opponent_active_pokemon
@@ -162,8 +165,6 @@ class RewardCalculator:
 
 
     # ============================================================
-    # TERMINAL REWARD
-    # ============================================================
     def compute_terminal_reward(self, battle):
         if battle.won: return self.terminal_win
         if battle.lost: return self.terminal_loss
@@ -171,21 +172,18 @@ class RewardCalculator:
 
 
     # ============================================================
-    # TURN REWARD
-    # ============================================================
     def compute_turn_reward(self, prev_battle, battle, action_was_switch=False, last_used_move=None):
-        
+
         my = battle.active_pokemon
         opp = battle.opponent_active_pokemon
-
         if my is None or opp is None:
             return 0.0
 
         reward = 0.0
 
-        # ------------------------------------------------------------
-        # FIRST TURN INIT
-        # ------------------------------------------------------------
+        # ============================================================
+        # FIRST TURN: initialize memory
+        # ============================================================
         if self.prev_my_bucket is None:
 
             self.prev_my_bucket = hp_bucket(my.current_hp_fraction)
@@ -200,120 +198,119 @@ class RewardCalculator:
             self.prev_my_boosts = my.boosts.copy()
             self.prev_opp_boosts = opp.boosts.copy()
 
+            # NEW danger/threat initialization
+            d, dying = danger_score(my, opp)
+            kt = kill_threat_score(my, opp)
+            self.prev_danger = d
+            self.prev_kill_threat = kt
+
             self.prev_matchup_score = self.compute_switch_heuristic_score(battle)
             self.last_active_species = my.species
-
             return 0.0
 
         # ============================================================
-        # 1. HP CHANGE REWARDS
+        # 1. HP bucket change
         # ============================================================
         my_b = hp_bucket(my.current_hp_fraction)
         opp_b = hp_bucket(opp.current_hp_fraction)
 
-        if opp_b < self.prev_opp_bucket:
-            reward += self.hp_reward
+        # NEW — bucket *difference* matters
+        opp_drop = self.prev_opp_bucket - opp_b
+        my_drop  = self.prev_my_bucket - my_b
 
-        if my_b < self.prev_my_bucket:
-            reward -= self.hp_penalty
+        if opp_drop > 0:
+            reward += self.hp_reward * opp_drop      # reward proportional to HP removed
+
+        if my_drop > 0:
+            reward -= self.hp_penalty * my_drop      # penalty proportional to HP lost
 
         # ============================================================
-        # 2. KOs
+        # 2. KO events
         # ============================================================
         my_fainted = sum(p.fainted for p in battle.team.values())
         opp_fainted = sum(p.fainted for p in battle.opponent_team.values())
 
-        if opp_fainted > self.prev_opp_fainted:
-            reward += self.ko_reward
-
-        if my_fainted > self.prev_my_fainted:
-            reward -= self.faint_penalty
+        if opp_fainted > self.prev_opp_fainted: reward += self.ko_reward
+        if my_fainted > self.prev_my_fainted: reward -= self.faint_penalty
 
         # ============================================================
-        # 3. STATUS EFFECTS
+        # 3. Status events
         # ============================================================
         my_status = sum(1 for p in battle.team.values() if p.status)
         opp_status = sum(1 for p in battle.opponent_team.values() if p.status)
 
-        if opp_status > self.prev_opp_status:
-            reward += self.status_reward
-
-        if my_status > self.prev_my_status:
-            reward -= self.status_penalty
+        if opp_status > self.prev_opp_status: reward += self.status_reward
+        if my_status > self.prev_my_status: reward -= self.status_penalty
 
         # ============================================================
-        # 4. DIMINISHING BOOST REWARDS (MAIN FIX)
+        # 4. Boosts with diminishing returns
         # ============================================================
-        for stat in ("atk", "spa"):
+        for stat in ("atk","spa"):
             old = self.prev_my_boosts.get(stat, 0)
             new = my.boosts.get(stat, 0)
             if new > old:
                 reward += diminishing_boost_value(new, self.boost_base) - diminishing_boost_value(old, self.boost_base)
 
-        # Defense boosts (half value)
-        for stat in ("def", "spd"):
+        for stat in ("def","spd"):
             old = self.prev_my_boosts.get(stat, 0)
             new = my.boosts.get(stat, 0)
             if new > old:
                 reward += 0.5 * (diminishing_boost_value(new, self.boost_base) - diminishing_boost_value(old, self.boost_base))
 
-        # Speed boosts (binary usefulness)
         old = self.prev_my_boosts.get("spe", 0)
         new = my.boosts.get("spe", 0)
         if new > old:
-            reward += 6   # outspeed bonus
-            if new > 1:
-                reward += (new - 1)  # diminishing extra
+            reward += 6
+            if new > 1: reward += (new - 1)
 
         # ============================================================
-        # 5. SUICIDE BOOSTING FIXED
+        # 5. NEW — Danger & Kill Threat shaping
+        # ============================================================
+        new_danger, dying = danger_score(my, opp)
+        new_kill_threat = kill_threat_score(my, opp)
+
+        # reward increasing kill threat
+        if new_kill_threat > self.prev_kill_threat:
+            reward += self.kill_threat_bonus * (new_kill_threat - self.prev_kill_threat)
+
+        # penalize leaving yourself exposed
+        if new_danger > self.prev_danger:
+            reward -= self.danger_penalty * (new_danger - self.prev_danger)
+
+        # reward reducing danger via good move or good switch
+        if new_danger < self.prev_danger:
+            reward += self.danger_reduction_bonus * (self.prev_danger - new_danger)
+
+        # special penalty: dying while having a >50% kill move available
+        if dying and new_kill_threat < 0.2:
+            reward -= 10.0  # encourages priority or switching
+
+        # ============================================================
+        # 6. Suicide boosting
         # ============================================================
         if my_fainted > self.prev_my_fainted and last_used_move:
-            move_id = last_used_move.id.lower()
+            mv = last_used_move.id.lower()
 
-            # Punish wasted boosting only
-            if move_id in BOOSTING_MOVES:
-                # "Could have acted"
+            if mv in BOOSTING_MOVES:
                 my_speed = get_real_stats(my.species)["spe"]
                 opp_speed = get_real_stats(opp.species)["spe"]
-
                 if my_speed >= opp_speed:
                     reward -= self.suicide_boost_penalty
 
-            # Utility moves -> never punish
-            elif move_id in UTILITY_MOVES:
-                pass
-
         # ============================================================
-        # 6. USELESS / IMMUNE MOVE PENALTY
+        # 7. Useless move penalty
         # ============================================================
         if last_used_move:
-            imm = False
-
+            eff = 1
             try:
                 eff = last_used_move.type.damage_multiplier(opp.type_1, opp.type_2)
-                if eff == 0:
-                    imm = True
             except:
                 pass
-
-            # Dragon vs Fairy immunity
-            if last_used_move.type and last_used_move.type.name == "Dragon":
-                if (opp.type_1 and opp.type_1.name == "Fairy") or \
-                   (opp.type_2 and opp.type_2.name == "Fairy"):
-                    imm = True
-
-            # Will-O-Wisp vs Fire or statused target
-            if last_used_move.id == "willowisp":
-                if (opp.type_1 and opp.type_1.name == "Fire") or \
-                   (opp.type_2 and opp.type_2.name == "Fire") or opp.status:
-                    imm = True
-
-            if imm:
+            if eff == 0:
                 reward -= 8.0
 
         # ============================================================
-        # 7. SWITCH REWARDS (use heuristic delta)
+        # 8. Switch rewards
         # ============================================================
         forced_switch = (my_fainted > self.prev_my_fainted)
 
@@ -321,52 +318,42 @@ class RewardCalculator:
 
             new_score = self.compute_switch_heuristic_score(battle)
             delta = new_score - self.prev_matchup_score
-
             reward += delta * self.switch_weight
 
             # waste boosts
-            total_pos = sum(max(0, my.boosts.get(s, 0)) for s in ("atk","def","spa","spd","spe"))
+            total_pos = sum(max(0, my.boosts.get(s,0)) for s in ("atk","def","spa","spd","spe"))
             reward -= self.wasted_boost_penalty * total_pos
 
             # escape debuffs
-            total_neg = sum(abs(min(0, my.boosts.get(s, 0))) for s in ("atk","def","spa","spd","spe"))
+            total_neg = sum(abs(min(0, my.boosts.get(s,0))) for s in ("atk","def","spa","spd","spe"))
             reward += self.debuff_escape_reward * total_neg
 
-            # switch chain penalties
+            # switch spam penalties
             self.consecutive_switches += 1
             self.recent_switches.append(1)
 
             if self.consecutive_switches > 1:
-                reward -= self.switch_chain_penalty * (self.consecutive_switches - 1)
+                reward -= self.switch_chain_penalty * (self.consecutive_switches-1)
 
-            # spam
             if len(self.recent_switches) > self.switch_window:
                 self.recent_switches.pop(0)
+
             if sum(self.recent_switches) >= 3:
                 reward -= self.switch_spam_penalty
 
-            # oscillation
             if self.last_switch_species == my.species:
                 reward -= self.oscillation_penalty
 
             self.last_switch_species = self.last_active_species
 
-        elif forced_switch:
-            self.consecutive_switches = 0
-            self.recent_switches.append(0)
-
-        else:
-            self.consecutive_switches = 0
-            self.recent_switches.append(0)
-
         # ============================================================
-        # 8. PIVOT MOVES
+        # 9. Pivot moves
         # ============================================================
         if last_used_move and last_used_move.id.lower() in PIVOT_MOVES:
             reward += self.pivot_reward
 
         # ============================================================
-        # 9. TURN TICK
+        # 10. Turn pacing
         # ============================================================
         reward -= self.turn_penalty
 
@@ -382,7 +369,11 @@ class RewardCalculator:
         self.prev_my_boosts = my.boosts.copy()
         self.prev_opp_boosts = opp.boosts.copy()
         self.prev_matchup_score = self.compute_switch_heuristic_score(battle)
-        self.last_active_species = my.species
 
+        # NEW
+        self.prev_danger = new_danger
+        self.prev_kill_threat = new_kill_threat
+
+        self.last_active_species = my.species
         self.add(reward)
         return 0.0
