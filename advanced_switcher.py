@@ -1,50 +1,68 @@
-# advanced_switcher.py
+# advanced_switcher.py  (FIXED MINIMALLY & SAFELY)
 
 from poke_env.battle.abstract_battle import AbstractBattle
 from poke_env.battle.pokemon import Pokemon
+from computed_stats import get_real_stats
+
 
 class SwitchHeuristics:
     """
-    Standalone switch AI using the exact logic from SimpleHeuristicsPlayer.
-    Useful for RL reward shaping, or as a hybrid model.
+    Standalone switch AI using logic similar to SimpleHeuristicsPlayer,
+    but now using computed real stats (including boosts) for speed.
     """
 
     SWITCH_OUT_MATCHUP_THRESHOLD = -2
     SPEED_TIER_COEFICIENT = 0.1
     HP_FRACTION_COEFICIENT = 0.4
 
+    def _effective_speed(self, mon: Pokemon) -> int:
+        """Real speed = computed base speed + boost levels."""
+        if mon is None:
+            return 0
+        stats = get_real_stats(mon.species)
+        base_spe = stats["spe"]
+        boost = mon.boosts.get("spe", 0)
+
+        # Showdown boost scaling (approx)
+        # Each stage is multiplicative: stage +6 → ×4; stage -6 → ×1/4
+        # But RL heuristics only need relative comparison, so additive is fine.
+        return base_spe + boost * 50  # conservative and consistent with reward calc
+
     def estimate_matchup(self, mon: Pokemon, opponent: Pokemon) -> float:
-        """Same matchup formula used in SimpleHeuristicsPlayer."""
+        """Matchup score identical to original logic except for corrected speed."""
         score = max([opponent.damage_multiplier(t) for t in mon.types if t is not None])
         score -= max(
             [mon.damage_multiplier(t) for t in opponent.types if t is not None]
         )
 
-        # Speed tier bonus
-        if mon.base_stats["spe"] > opponent.base_stats["spe"]:
+        # SPEED (using computed stats + boosts)
+        my_spe = self._effective_speed(mon)
+        opp_spe = self._effective_speed(opponent)
+
+        if my_spe > opp_spe:
             score += self.SPEED_TIER_COEFICIENT
-        elif opponent.base_stats["spe"] > mon.base_stats["spe"]:
+        elif opp_spe > my_spe:
             score -= self.SPEED_TIER_COEFICIENT
 
-        # HP contribution
+        # HP difference
         score += mon.current_hp_fraction * self.HP_FRACTION_COEFICIENT
         score -= opponent.current_hp_fraction * self.HP_FRACTION_COEFICIENT
 
         return score
 
     def should_switch_out(self, battle: AbstractBattle) -> bool:
-        """Direct extraction of SimpleHeuristicsPlayer._should_switch_out."""
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
 
-        # Any GOOD switch-in?
+        # Any GOOD switch-in available?
         decent_switches = [
             m for m in battle.available_switches
             if self.estimate_matchup(m, opponent) > 0
         ]
+
         if decent_switches:
 
-            # Stat-drop based switching
+            # Stat-drop switching
             if active.boosts["def"] <= -3 or active.boosts["spd"] <= -3:
                 return True
             if active.boosts["atk"] <= -3 and active.stats["atk"] >= active.stats["spa"]:
@@ -59,7 +77,6 @@ class SwitchHeuristics:
         return False
 
     def best_switch_target(self, battle: AbstractBattle):
-        """Return the optimal switch destination."""
         if not battle.available_switches:
             return None
 
