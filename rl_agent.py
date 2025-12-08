@@ -1,5 +1,8 @@
 # ============================================================
 # FIXED & CLEANED RL AGENT WITH AUTO STATE SIZE DETECTION
+# + PER-PHASE LR/ENTROPY CONTROL
+# + SAFE STATE SIZE MISMATCH HANDLING
+# + RETURN CLIPPING
 # ============================================================
 
 from poke_env.player.player import Player
@@ -14,7 +17,6 @@ from torch.utils.tensorboard import SummaryWriter
 from advanced_switcher import SwitchHeuristics
 from rewards import RewardCalculator
 from state_encoder import encode_state
-
 
 MOVE_ACTIONS = [0, 1, 2, 3]
 SWITCH_OFFSET = 4
@@ -55,7 +57,6 @@ class ActorCriticNet(nn.Module):
 # ============================================================
 
 class MyRLAgent(Player):
-
     def __init__(
         self,
         battle_format="gen9ubers",
@@ -76,13 +77,16 @@ class MyRLAgent(Player):
     ):
         super().__init__(battle_format=battle_format, **kwargs)
 
+        # Core hyperparams
         self.gamma = gamma
         self.lr = lr
+        self.base_lr = lr  # for reference
         self.entropy_coef = entropy_coef
+        self.base_entropy_coef = entropy_coef
         self.value_coef = value_coef
         self.batch_size = batch_size
 
-        # Epsilon config
+        # Epsilon config (per-phase values will override these)
         self.epsilon = epsilon_start
         self.epsilon_start = epsilon_start
         self.epsilon_end = epsilon_end
@@ -135,7 +139,7 @@ class MyRLAgent(Player):
         self.state_size = state_size
         self.model = ActorCriticNet(state_size, action_size=10, hidden_size=512)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
-        print(f"[RL] Model initialized with state_size={state_size}")
+        print(f"[RL] Model initialized with state_size={state_size}, lr={self.lr}")
 
     def choose_team(self, battle):
         return "/team 213456"
@@ -144,6 +148,9 @@ class MyRLAgent(Player):
         return "/team 213456"
 
     def _try_load_model(self):
+        if not self.model_folder:
+            return
+
         path = os.path.join(self.model_folder, "checkpoint.pth")
         if not os.path.exists(path):
             print("[RL] No checkpoint found.")
@@ -164,7 +171,7 @@ class MyRLAgent(Player):
             print("[RL] ERROR loading checkpoint — mismatched dimensions!")
             print("→ Delete the old checkpoint and retrain.")
             print(e)
-    
+
     def save_model(self):
         if not self.model_folder or self.model is None:
             return
@@ -177,6 +184,22 @@ class MyRLAgent(Player):
         }
         torch.save(ckpt, os.path.join(self.model_folder, "checkpoint.pth"))
         print("[RL] Model saved.")
+
+    # ============================================================
+    # PHASE-LEVEL HYPERPARAM CONTROL
+    # ============================================================
+
+    def set_lr(self, lr: float):
+        """Update optimizer LR safely."""
+        self.lr = lr
+        if self.optimizer is not None:
+            for g in self.optimizer.param_groups:
+                g["lr"] = lr
+        print(f"[RL] Learning rate set to {lr:g}")
+
+    def set_entropy_coef(self, coef: float):
+        self.entropy_coef = coef
+        print(f"[RL] Entropy coefficient set to {coef:g}")
 
     # ============================================================
     # LEGAL ACTIONS
@@ -306,11 +329,11 @@ class MyRLAgent(Player):
         # 1. Compute reward for transition (prev_battle_state -> battle)
         # --------------------------------------------------------
         if self.prev_battle_state is not None:
-            # This accumulates reward for the last (s, a, ...) we took
             self.reward_calc.compute_turn_reward(
                 self.prev_battle_state,
                 battle,
                 action_was_switch=self.last_action_was_switch,
+                last_used_move=self.last_used_move,
             )
 
         # If the SHOWDOWN turn number advanced, flush accumulated reward
@@ -333,9 +356,22 @@ class MyRLAgent(Player):
         )
 
         # --------------------------------------------------------
-        # 3. Encode current state (needed for logging forced/expert actions)
+        # 3. Encode current state
         # --------------------------------------------------------
-        state_vec = encode_state(battle).astype(np.float32)
+        raw_state_vec = encode_state(battle).astype(np.float32)
+
+        # If model already exists, but encoder changed length, pad/truncate safely.
+        if self.model is not None and self.state_size is not None:
+            if len(raw_state_vec) != self.state_size:
+                # Non-ideal, but allows you to keep old checkpoints after encoder tweaks.
+                fixed = np.zeros(self.state_size, dtype=np.float32)
+                n = min(self.state_size, len(raw_state_vec))
+                fixed[:n] = raw_state_vec[:n]
+                state_vec = fixed
+            else:
+                state_vec = raw_state_vec
+        else:
+            state_vec = raw_state_vec
 
         # Initialize model on first ever state
         if self.model is None:
@@ -365,7 +401,6 @@ class MyRLAgent(Player):
 
             if best is None:
                 # Fallback: first non-None switch target
-                best = None
                 for mon in switches:
                     if mon is not None:
                         best = mon
@@ -407,7 +442,6 @@ class MyRLAgent(Player):
             self.battle_history.append((state_vec.copy(), 0, 0.0, False))
             self.prev_battle_state = battle
             self.last_action_was_switch = False
-            # last_action_priority handled inside action_to_move if needed
             return move
 
         # 5a. Voluntary expert switching (if enabled)
@@ -479,9 +513,10 @@ class MyRLAgent(Player):
     # ============================================================
     # BATTLE END
     # ============================================================
+
     def _battle_finished_callback(self, battle):
-        # Call your existing logic
         self.on_battle_end(battle)
+
     def on_battle_end(self, battle):
         # Final transition reward (prev_battle_state -> terminal battle)
         if self.prev_battle_state is not None:
@@ -489,6 +524,7 @@ class MyRLAgent(Player):
                 self.prev_battle_state,
                 battle,
                 action_was_switch=self.last_action_was_switch,
+                last_used_move=self.last_used_move,
             )
 
         # Flush remaining turn-level reward into last action
@@ -519,7 +555,7 @@ class MyRLAgent(Player):
 
         # ε decay: once per battle (as intended)
         self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
-       
+
         # Train if we have a full batch
         if len(self.experience_buffer) >= self.batch_size:
             self._train_batch()
@@ -542,7 +578,9 @@ class MyRLAgent(Player):
             # Push non-expert examples only (skip_flag=False)
             for (s, a, r, skip_flag), R in zip(ep, returns):
                 if not skip_flag:
-                    self.experience_buffer.append((s, a, R))
+                    # Mild return clipping for stability
+                    R_clipped = max(-10.0, min(10.0, R))
+                    self.experience_buffer.append((s, a, R_clipped))
 
     # ============================================================
     # TRAINING
@@ -590,13 +628,6 @@ class MyRLAgent(Player):
         self.writer.add_scalar("Loss/Value", value_loss.item(), self.global_train_step)
         self.writer.add_scalar("Entropy", entropy.item(), self.global_train_step)
         self.writer.add_scalar("Epsilon", self.epsilon, self.global_train_step)
+        self.writer.add_scalar("LR", self.lr, self.global_train_step)
 
         self.global_train_step += 1
-
-        #print(
-         #   f"[TRAIN] loss={loss.item():.4f} "
-          #  f"policy={policy_loss.item():.4f} "
-           # f"value={value_loss.item():.4f} "
-            #f"entropy={entropy.item():.4f} "
-           # f"eps={self.epsilon:.3f}"
-        #)

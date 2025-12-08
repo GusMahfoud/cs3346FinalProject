@@ -1,4 +1,6 @@
-# train_parallel.py  --  Curriculum RL with per-phase epsilon resets + FULL LIFETIME STATS
+# train_parallel.py  --  Curriculum RL with per-phase epsilon resets
+#                        + FULL LIFETIME STATS
+#                        + PER-PHASE LR / ENTROPY SETTINGS
 import asyncio
 from collections import deque
 import sys
@@ -55,15 +57,23 @@ MIN_CYCLES = {
 }
 
 # ============================================================
-# Epsilon Reset Per Phase
+# Epsilon schedules (per phase)
 # ============================================================
 
-EPSILON_RESET = {
+EPSILON_START = {
     "warmup": 1.0,
     "phase1": 0.8,
-    "phase2a": 0.9,
-    "phase2b": 0.9,
-    "phase3b": 0.7,
+    "phase2a": 0.3,
+    "phase2b": 0.2,   # low: RL switching, don't destroy policy
+    "phase3b": 0.1,   # final heuristic boss
+}
+
+EPSILON_END = {
+    "warmup": 0.2,
+    "phase1": 0.10,
+    "phase2a": 0.05,
+    "phase2b": 0.05,
+    "phase3b": 0.03,
 }
 
 EPSILON_DECAY = {
@@ -72,6 +82,26 @@ EPSILON_DECAY = {
     "phase2a": 0.9991,
     "phase2b": 0.99864,
     "phase3b": 0.99864,
+}
+
+# ============================================================
+# Per-phase LR & entropy (stability knobs)
+# ============================================================
+
+LR_PER_PHASE = {
+    "warmup": 1e-3,
+    "phase1": 1e-3,
+    "phase2a": 7e-4,
+    "phase2b": 3e-4,   # more conservative with RL switching
+    "phase3b": 3e-4,
+}
+
+ENTROPY_PER_PHASE = {
+    "warmup": 0.08,
+    "phase1": 0.06,
+    "phase2a": 0.05,
+    "phase2b": 0.03,
+    "phase3b": 0.02,
 }
 
 # ============================================================
@@ -87,6 +117,7 @@ TRAIN_PHASES = [
 ]
 
 START_PHASE = "warmup"
+
 
 # ============================================================
 # Helpers
@@ -116,31 +147,38 @@ def configure_agent_for_phase(agent: MyRLAgent, phase: str):
     elif p == "phase2a":
         agent.allow_switching = True
         agent.use_expert_switching = True
-        agent.rl_switch_enabled = False
+        agent.rl_switch_enabled = False  # expert only
 
     elif p == "phase2b":
         agent.allow_switching = True
         agent.use_expert_switching = False
-        agent.rl_switch_enabled = True
+        agent.rl_switch_enabled = True   # RL controls switching
 
     elif p == "phase3b":
         agent.allow_switching = True
         agent.use_expert_switching = False
-        agent.rl_switch_enabled = True
+        agent.rl_switch_enabled = True   # RL controls switching vs heuristic bot
 
     else:
         raise ValueError(f"Unknown phase: {phase}")
 
-    # Reset epsilon for this phase
-    agent.epsilon = EPSILON_RESET[p]
+    # Reset epsilon schedule for this phase
+    agent.epsilon = EPSILON_START[p]
+    agent.epsilon_start = EPSILON_START[p]
+    agent.epsilon_end = EPSILON_END[p]
     agent.epsilon_decay = EPSILON_DECAY[p]
+
+    # Per-phase LR and entropy
+    agent.set_lr(LR_PER_PHASE[p])
+    agent.set_entropy_coef(ENTROPY_PER_PHASE[p])
 
     print(
         f"[CONFIG] Phase={p.upper()} | allow={agent.allow_switching} | "
         f"expert={agent.use_expert_switching} | rl_switch={agent.rl_switch_enabled}"
     )
     print(
-        f"[CONFIG] Epsilon reset → {agent.epsilon:.3f}, decay={agent.epsilon_decay:.6f}"
+        f"[CONFIG] Epsilon: start={agent.epsilon_start:.3f}, "
+        f"end={agent.epsilon_end:.3f}, decay={agent.epsilon_decay:.6f}"
     )
 
 
@@ -249,7 +287,7 @@ async def train_forever():
         phase_finished += batch_finished
         phase_wins += batch_wins
 
-        batch_winrate = batch_wins / batch_finished if batch_finished else 0
+        batch_winrate = batch_wins / batch_finished if batch_finished else 0.0
         winrates.append(batch_winrate)
         r_avg = rolling_avg(winrates)
 
@@ -261,8 +299,10 @@ async def train_forever():
             f"Record: {phase_wins}/{phase_finished} ({(phase_wins/phase_finished*100):.1f}%)"
         )
 
-        print(f"--- Lifetime: {lifetime_wins}/{lifetime_finished} "
-              f"({(lifetime_wins/lifetime_finished)*100:.1f}%) across {lifetime_batches} batches")
+        print(
+            f"--- Lifetime: {lifetime_wins}/{lifetime_finished} "
+            f"({(lifetime_wins/lifetime_finished)*100:.1f}%) across {lifetime_batches} batches"
+        )
 
         # --- PROCESS TRAINING BUFFERS ---
         if rl_agent.episode_buffer:
@@ -288,8 +328,10 @@ async def train_forever():
             lifetime_by_phase[phase]["batches"] += phase_batches
 
             print("\n===== PHASE SUMMARY =====")
-            print(f"Phase {phase.upper()} | Wins={phase_wins}/{phase_finished} "
-                  f"({(phase_wins/phase_finished)*100:.1f}%) over {phase_batches} batches")
+            print(
+                f"Phase {phase.upper()} | Wins={phase_wins}/{phase_finished} "
+                f"({(phase_wins/phase_finished)*100:.1f}%) over {phase_batches} batches"
+            )
 
             print("\n=== ADVANCING TO NEXT PHASE ===")
 
@@ -299,15 +341,19 @@ async def train_forever():
             if phase_index >= len(TRAIN_PHASES):
                 print("\n===== TRAINING COMPLETE =====")
                 print("\n===== FINAL LIFETIME STATS =====")
-                print(f"Total wins: {lifetime_wins}/{lifetime_finished} "
-                      f"({(lifetime_wins/lifetime_finished)*100:.2f}%)")
+                print(
+                    f"Total wins: {lifetime_wins}/{lifetime_finished} "
+                    f"({(lifetime_wins/lifetime_finished)*100:.2f}%)"
+                )
 
                 print("Per-phase breakdown:")
                 for p, rec in lifetime_by_phase.items():
                     if rec["finished"] > 0:
                         wr = rec["wins"] / rec["finished"] * 100
-                        print(f"  {p.upper()}: {rec['wins']}/{rec['finished']} "
-                              f"({wr:.1f}%) in {rec['batches']} batches")
+                        print(
+                            f"  {p.upper()}: {rec['wins']}/{rec['finished']} "
+                            f"({wr:.1f}%) in {rec['batches']} batches"
+                        )
                 break
 
             # --- RESET FOR NEXT PHASE ---
