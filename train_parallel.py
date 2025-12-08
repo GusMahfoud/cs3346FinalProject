@@ -24,7 +24,7 @@ from fixed_ais import (
 
 MINIBATCH = 50
 MAX_PARALLEL = 16
-MODEL_FOLDER = "models/a2c_v21"
+MODEL_FOLDER = "models/a2c_v24"
 
 ROLLING_WINDOW = 20
 MAX_PHASE_BATTLES = 10000
@@ -60,7 +60,7 @@ MIN_CYCLES = {
 EPSILON_RESET = {
     "warmup": 1.0,
     "phase1": 0.8,
-    "phase2a": 0.6,
+    "phase2a": 0.9,
     "phase2b": 0.9,
     "phase3a": 0.8,
     "phase3b": 0.7,
@@ -254,6 +254,7 @@ async def train_forever():
         r_avg = rolling_avg(winrates)
 
         print(f"[{phase}] Batch {cycle}: {batch_wins}/{batch_finished} ({batch_winrate*100:.1f}%)")
+        print(f"[{phase}] Epsilon now: {rl_agent.epsilon:.4f} (≈ {rl_agent.epsilon*100:.1f}% random actions)")
         print(f"[{phase}] Rolling average: {r_avg*100:.1f}% ({len(winrates)} samples)")
         print(
             f"[{phase}] Phase battles: {phase_finished} | "
@@ -279,7 +280,7 @@ async def train_forever():
         manual = (key_pressed() == MANUAL_SKIP_KEY)
 
         # advancement conditions
-        enough_cycles = cycle >= MIN_CYCLES[phase]
+        enough_cycles = phase_batches >= MIN_CYCLES[phase]
         good_avg = r_avg >= THRESHOLDS[phase]
         too_long = phase_finished >= MAX_PHASE_BATTLES
 
