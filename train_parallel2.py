@@ -26,7 +26,7 @@ from fixed_ais import (
 
 MINIBATCH = 50
 MAX_PARALLEL = 16
-MODEL_FOLDER = "models/a2c_v24"
+MODEL_FOLDER = "models/a2c_v35"
 
 ROLLING_WINDOW = 20
 MAX_PHASE_BATTLES = 10000
@@ -97,11 +97,11 @@ LR_PER_PHASE = {
 }
 
 ENTROPY_PER_PHASE = {
-    "warmup": 0.08,
-    "phase1": 0.06,
-    "phase2a": 0.05,
-    "phase2b": 0.03,
-    "phase3b": 0.02,
+    "warmup": 0.01,
+    "phase1": 0.01,
+    "phase2a": 0.01,
+    "phase2b": 0.01,
+    "phase3b": 0.01,
 }
 
 # ============================================================

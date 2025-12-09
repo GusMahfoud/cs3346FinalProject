@@ -10,6 +10,77 @@ from computed_stats import get_real_stats
 # ============================================================
 MAX_FEATURES = 1500
 
+from poke_env.data.gen_data import GenData
+
+GEN9_DATA = GenData.from_gen(9)
+TYPE_CHART = GEN9_DATA.type_chart
+
+
+def compute_matchup_score(my_stats, opp_stats, my_types, opp_types):
+    """
+    Recreates your earlier heuristic:
+    - Best offensive multiplier (my_types → opp_types)
+    - Best defensive multiplier (opp_types → my_types)
+    - Speed differential bonus
+    - Bulk comparison bonus
+    - Final score clipped to [-3, 3]
+    """
+
+    # ------------------------------------------------------------
+    # 1. OFFENSIVE TYPE MULTIPLIER  (my attack → their defense)
+    # ------------------------------------------------------------
+    try:
+        my_attack_mult = 1.0
+        for t in my_types:
+            if not t:
+                continue
+            for ot in opp_types:
+                if ot:
+                    my_attack_mult = max(my_attack_mult, TYPE_CHART[t][ot])
+    except Exception:
+        my_attack_mult = 1.0
+
+    # ------------------------------------------------------------
+    # 2. DEFENSIVE TYPE MULTIPLIER (their attack → my defense)
+    # ------------------------------------------------------------
+    try:
+        opp_attack_mult = 1.0
+        for t in opp_types:
+            if not t:
+                continue
+            for mt in my_types:
+                if mt:
+                    opp_attack_mult = max(opp_attack_mult, TYPE_CHART[t][mt])
+    except Exception:
+        opp_attack_mult = 1.0
+
+    # Offensive advantage minus defensive disadvantage
+    type_score = np.log(my_attack_mult) - np.log(opp_attack_mult)
+
+    # ------------------------------------------------------------
+    # 3. SPEED RELATIVE BONUS
+    # ------------------------------------------------------------
+    if my_stats["spe"] > opp_stats["spe"]:
+        speed_score = 0.15
+    elif my_stats["spe"] < opp_stats["spe"]:
+        speed_score = -0.15
+    else:
+        speed_score = 0.0
+
+    # ------------------------------------------------------------
+    # 4. BULK RATIO BONUS
+    # ------------------------------------------------------------
+    my_bulk = my_stats["hp"] * (my_stats["def"] + my_stats["spd"])
+    opp_bulk = opp_stats["hp"] * (opp_stats["def"] + opp_stats["spd"])
+
+    bulk_score = 0.1 * np.tanh(np.log((my_bulk + 1e-9) / (opp_bulk + 1e-9)))
+
+    # ------------------------------------------------------------
+    # FINAL: sum + clamp to stable range
+    # ------------------------------------------------------------
+    raw = type_score + speed_score + bulk_score
+    return float(np.clip(raw, -3.0, 3.0))
+
 def finalize_vector(vec):
     """Pad/truncate to MAX_FEATURES so model always receives fixed length."""
     L = len(vec)
