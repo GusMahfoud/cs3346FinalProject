@@ -29,7 +29,7 @@ from fixed_ais import (
 
 MINIBATCH = 50
 MAX_PARALLEL = 16
-MODEL_FOLDER = "models/a2c_v48"
+MODEL_FOLDER = "models/a2c_v49"
 
 ROLLING_WINDOW = 20
 MAX_PHASE_BATTLES = 10000
@@ -85,7 +85,7 @@ EPSILON_END = {
     "warmup": 0.15,
     "phase1": 0.05,
     "phase2": 0.05,
-    "phase3": 0.03,
+    "phase3": 0.02,
 }
 
 EPSILON_DECAY = {
