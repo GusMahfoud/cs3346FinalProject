@@ -14,7 +14,7 @@ class SwitchHeuristics:
     # ================================================================
     # CONFIG CONSTANTS — YOUR ORIGINAL VALUES
     # ================================================================
-    DEBUG = True   # set True if you want printouts, otherwise stays silent
+    DEBUG = False   # set True if you want printouts, otherwise stays silent
     SWITCH_OUT_MATCHUP_THRESHOLD = 3
 
     TYPE_COEFF = 1.0
@@ -132,8 +132,8 @@ class SwitchHeuristics:
         best_mv = None
         best_frac = -1.0
 
-        if self.DEBUG:
-            print(f"\n[PREDICT] Evaluating species-default moves for {opp.species} vs {me.species}")
+        #if self.DEBUG:
+         #   print(f"\n[PREDICT] Evaluating species-default moves for {opp.species} vs {me.species}")
 
         for mv in moves:
             frac, _, _, _ = estimate_damage(mv, opp, me)
@@ -147,7 +147,7 @@ class SwitchHeuristics:
                 best_mv = mv
 
         if self.DEBUG:
-            print(f"[PREDICT] Selected {best_mv.id} with predicted frac={best_frac:.3f}")
+            print(f"[PREDICT] Selected {best_mv} with predicted frac={best_frac:.3f} by {opp.species} vs {me.species}")
 
         return best_mv, best_frac
     # ================================================================
