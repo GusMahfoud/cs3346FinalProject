@@ -26,7 +26,7 @@ from fixed_ais import (
 
 MINIBATCH = 50
 MAX_PARALLEL = 16
-MODEL_FOLDER = "models/a2c_v24"
+MODEL_FOLDER = "models/a2c_v50"
 
 ROLLING_WINDOW = 20
 MAX_PHASE_BATTLES = 10000
