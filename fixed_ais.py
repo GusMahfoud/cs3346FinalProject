@@ -19,11 +19,11 @@ TEAM_ORDER_CMD = "/team 213456"
 class FixedTeamOrderMixin:
     """Mixin that forces Pokémon Showdown to respect a fixed lead order."""
 
-    def teampreview(self, battle):
-        return TEAM_ORDER_CMD
+    #def teampreview(self, battle):
+     #   return TEAM_ORDER_CMD
 
-    def choose_team(self, battle):
-        return TEAM_ORDER_CMD
+    #def choose_team(self, battle):
+     #   return TEAM_ORDER_CMD
 
 
 # ============================================================

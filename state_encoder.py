@@ -1,504 +1,342 @@
-# encoder.py — FINAL HIGH-RES SWITCHING VERSION
+# ============================================================
+# encoder.py — FIXED VERSION (Correct Type Chart + Debugging)
+# ============================================================
+
 import numpy as np
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.move import Move
-from computed_stats import get_real_stats
-
-
-# ============================================================
-# FIXED OUTPUT SIZE
-# ============================================================
-MAX_FEATURES = 1500
-
 from poke_env.data.gen_data import GenData
 
+from computed_stats import get_real_stats
+from advanced_switcher import SwitchHeuristics
+
+heuristic = SwitchHeuristics()
+
+# ============================================================
+# CONSTANTS & TYPE CHART
+# ============================================================
+
 GEN9_DATA = GenData.from_gen(9)
-TYPE_CHART = GEN9_DATA.type_chart
+TYPE_CHART = GEN9_DATA.type_chart  # Mostly unused now, but kept for inspection
 
+MAX_FEATURES = 450
 
-def compute_matchup_score(my_stats, opp_stats, my_types, opp_types):
-    """
-    Recreates your earlier heuristic:
-    - Best offensive multiplier (my_types → opp_types)
-    - Best defensive multiplier (opp_types → my_types)
-    - Speed differential bonus
-    - Bulk comparison bonus
-    - Final score clipped to [-3, 3]
-    """
-
-    # ------------------------------------------------------------
-    # 1. OFFENSIVE TYPE MULTIPLIER  (my attack → their defense)
-    # ------------------------------------------------------------
-    try:
-        my_attack_mult = 1.0
-        for t in my_types:
-            if not t:
-                continue
-            for ot in opp_types:
-                if ot:
-                    my_attack_mult = max(my_attack_mult, TYPE_CHART[t][ot])
-    except Exception:
-        my_attack_mult = 1.0
-
-    # ------------------------------------------------------------
-    # 2. DEFENSIVE TYPE MULTIPLIER (their attack → my defense)
-    # ------------------------------------------------------------
-    try:
-        opp_attack_mult = 1.0
-        for t in opp_types:
-            if not t:
-                continue
-            for mt in my_types:
-                if mt:
-                    opp_attack_mult = max(opp_attack_mult, TYPE_CHART[t][mt])
-    except Exception:
-        opp_attack_mult = 1.0
-
-    # Offensive advantage minus defensive disadvantage
-    type_score = np.log(my_attack_mult) - np.log(opp_attack_mult)
-
-    # ------------------------------------------------------------
-    # 3. SPEED RELATIVE BONUS
-    # ------------------------------------------------------------
-    if my_stats["spe"] > opp_stats["spe"]:
-        speed_score = 0.15
-    elif my_stats["spe"] < opp_stats["spe"]:
-        speed_score = -0.15
-    else:
-        speed_score = 0.0
-
-    # ------------------------------------------------------------
-    # 4. BULK RATIO BONUS
-    # ------------------------------------------------------------
-    my_bulk = my_stats["hp"] * (my_stats["def"] + my_stats["spd"])
-    opp_bulk = opp_stats["hp"] * (opp_stats["def"] + opp_stats["spd"])
-
-    bulk_score = 0.1 * np.tanh(np.log((my_bulk + 1e-9) / (opp_bulk + 1e-9)))
-
-    # ------------------------------------------------------------
-    # FINAL: sum + clamp to stable range
-    # ------------------------------------------------------------
-    raw = type_score + speed_score + bulk_score
-    return float(np.clip(raw, -3.0, 3.0))
-
-def finalize_vector(vec):
-    """Pad/truncate to MAX_FEATURES so model always receives fixed length."""
-    L = len(vec)
-    if L < MAX_FEATURES:
-        return np.array(vec + [0.0] * (MAX_FEATURES - L), dtype=np.float32)
-    elif L > MAX_FEATURES:
-        return np.array(vec[:MAX_FEATURES], dtype=np.float32)
-    else:
-        return np.array(vec, dtype=np.float32)
-
-
-# ============================================================
-# FIXED TEAM IDENTITY (STABLE ORDER)
-# ============================================================
 POKEMON_ORDER = [
-    "dragapult","gholdengo","kingambit",
-    "ironvaliant","weavile","skeledirge",
+    "dragapult", "gholdengo", "kingambit",
+    "ironvaliant", "weavile", "skeledirge",
 ]
-SPECIES_INDEX = {s: i for i, s in enumerate(POKEMON_ORDER)}
+SPECIES_INDEX = {name: i for i, name in enumerate(POKEMON_ORDER)}
 
-def _norm(n: str): return n.lower().replace(" ", "").replace("-", "")
-
-
-# ============================================================
-# TYPE ONE-HOT
-# ============================================================
 TYPE_LIST = [
-    "normal","fire","water","electric","grass","ice",
-    "fighting","poison","ground","flying","psychic",
-    "bug","rock","ghost","dragon","dark","steel","fairy"
+    "normal", "fire", "water", "electric", "grass", "ice",
+    "fighting", "poison", "ground", "flying", "psychic",
+    "bug", "rock", "ghost", "dragon", "dark", "steel", "fairy"
 ]
 TYPE_INDEX = {t: i for i, t in enumerate(TYPE_LIST)}
 
-def type_one_hot(p: Pokemon):
-    vec = [0] * len(TYPE_LIST)
-    if p is None:
-        return vec
-    for t in (p.type_1, p.type_2):
-        if t and t.name.lower() in TYPE_INDEX:
-            vec[TYPE_INDEX[t.name.lower()]] = 1
-    return vec
+SETUP_MOVES = {"swordsdance", "nastyplot", "calmmind", "torchsong", "quiverdance", "bellydrum"}
+RECOVERY_MOVES = {"recover", "slackoff", "roost", "moonlight", "morningsun"}
+PIVOT_MOVES = {"uturn", "voltswitch", "flipturn", "partingshot"}
+PROTECT_MOVES = {"protect"}
 
 
 # ============================================================
-# SPECIES ONE-HOT
+# BASIC UTILITIES
 # ============================================================
-def species_one_hot(p: Pokemon):
-    vec = [0] * len(POKEMON_ORDER)
-    if p is None:
-        return vec
-    sid = SPECIES_INDEX.get(_norm(p.species))
-    if sid is not None:
-        vec[sid] = 1
-    return vec
+
+def _norm(species: str):
+    return species.lower().replace("-", "").replace(" ", "")
 
 
-# ============================================================
-# HP UTILS
-# ============================================================
 def hp_fraction(p: Pokemon):
     if p is None or not p.max_hp:
         return 0.0
     return (p.current_hp or 0) / p.max_hp
 
-def hp_bucket_10(p: Pokemon):
-    return min(int(hp_fraction(p) * 10) / 9.0, 1.0)
 
-
-# ============================================================
-# SPEED + STAT BUCKETS
-# ============================================================
-def speed_bucket(raw: int):
-    if raw < 150: b = 0
-    elif raw < 200: b = 1
-    elif raw < 260: b = 2
-    elif raw < 320: b = 3
-    else: b = 4
-    return b / 4.0
-
-
-STAT_BUCKETS = {
-    "atk":  [180, 260, 310],
-    "def":  [200, 250, 300],
-    "spa":  [180, 260, 330],
-    "spd":  [180, 220, 260],
-    "hp":   [300, 360]
-}
-
-def stat_bucket(statname, value):
-    cuts = STAT_BUCKETS[statname]
-    if value < cuts[0]: return 0
-    elif value < cuts[1]: return 1
-    elif len(cuts)==3 and value < cuts[2]: return 2
-    else: return 3
-
-
-# ============================================================
-# DAMAGE ENGINE
-# ============================================================
-def stable_sigmoid(x):
-    if x >= 0:
-        z = np.exp(-x)
-        return 1 / (1 + z)
-    else:
-        z = np.exp(x)
-        return z / (1 + z)
-
-def estimate_damage(move: Move, user: Pokemon, opp: Pokemon):
-    if move is None or user is None or opp is None:
-        return 0, 0, 0, 0
-    try:
-        eff = move.type.damage_multiplier(opp.type_1, opp.type_2)
-    except:
-        eff = 1.0
-    if eff == 0:
-        return 0, 0, 0, 0
-
-    ustats = get_real_stats(user.species)
-    ostats = get_real_stats(opp.species)
-
-    if move.category.name == "PHYSICAL":
-        atk = ustats["atk"] * (2 + user.boosts["atk"]) / 2
-        defense = ostats["def"] * (2 + opp.boosts["def"]) / 2
-    elif move.category.name == "SPECIAL":
-        atk = ustats["spa"] * (2 + user.boosts["spa"]) / 2
-        defense = ostats["spd"] * (2 + opp.boosts["spd"]) / 2
-    else:
-        return 0, 0, 0, 0
-
-    bp = move.base_power or 0
-    raw = ((((((2*100)/5 + 2) * bp * atk / max(1, defense)) / 50) + 2) * eff)
-    raw *= 0.96
-
-    opp_hp = opp.current_hp or opp.max_hp or 1
-    frac = raw / opp_hp
-
-    # KO & 2HKO predictions
-    x1 = 12 * (raw - opp_hp) / opp_hp
-    x2 = 8 * ((2 * raw) - opp_hp) / opp_hp
-
-    p_kill = stable_sigmoid(x1)
-    p_2hko = stable_sigmoid(x2)
-
-    return min(frac,1.0), raw, p_kill, p_2hko
-
-
-# ============================================================
-# MOVE ENCODING (20 dims)
-# ============================================================
-SETUP_MOVES = {
-    "swordsdance","nastyplot","quiverdance","calmmind","bellydrum","torchsong"
-}
-RECOVERY_MOVES = {"recover","slackoff","roost","moonlight","morningsun"}
-PIVOT_MOVES = {"uturn","voltswitch","flipturn","partingshot"}
-PROTECT_MOVES = {"protect"}
-
-def encode_move(m: Move, user: Pokemon, opp: Pokemon):
-    if m is None:
-        return [0]*20
-
-    bp_norm = min((m.base_power or 0)/150, 1.0)
-    stab = 1 if m.type in {user.type_1, user.type_2} else 0
-
-    try: eff_raw = m.type.damage_multiplier(opp.type_1, opp.type_2)
-    except: eff_raw = 1.0
-
-    eff_norm = min(eff_raw/4.0, 1.0)
-    is_immune = 1 if eff_raw == 0 else 0
-
-    accuracy = (m.accuracy or 100) / 100
-    priority = 1 if m.priority > 0 else 0
-
-    is_setup = 1 if m.id in SETUP_MOVES else 0
-    is_status = 1 if m.category.name == "STATUS" else 0
-    has_secondary = 1 if getattr(m,"secondary",None) else 0
-    recovery = 1 if m.id in RECOVERY_MOVES else 0
-    pivot = 1 if m.id in PIVOT_MOVES else 0
-    protect = 1 if m.id in PROTECT_MOVES else 0
-
-    dmg_frac, raw_dmg, p_kill, p_2hko = estimate_damage(m, user, opp)
-
-    return [
-        bp_norm, stab, eff_norm, eff_raw/4.0, is_immune,
-        accuracy, priority, is_setup, is_status, has_secondary,
-        recovery, pivot, protect, is_immune,
-        dmg_frac,
-        raw_dmg/300,
-        p_kill,
-        p_2hko,
-        1 if dmg_frac == 0 else 0
-    ]
-
-def encode_moveset(user, opp):
-    moves = list(user.moves.values()) if user and user.moves else []
-    out = []
-    for i in range(4):
-        mv = moves[i] if i < len(moves) else None
-        out.extend(encode_move(mv, user, opp))
+def type_one_hot(p: Pokemon):
+    out = [0] * len(TYPE_LIST)
+    if p:
+        for t in (p.type_1, p.type_2):
+            if t:
+                nm = t.name.lower()
+                if nm in TYPE_INDEX:
+                    out[TYPE_INDEX[nm]] = 1
+                else:
+                    print(f"[TYPE WARN] Unknown type {nm} in type_one_hot.")
     return out
 
 
 # ============================================================
-# DANGER / THREAT
+# DAMAGE ENGINE — Corrected with GEN9_DATA.damage_multiplier
 # ============================================================
-def highest_expected_damage(attacker, defender):
-    if attacker is None or defender is None:
-        return 0
-    best = 0
-    for mv in attacker.moves.values():
-        frac,_,_,_ = estimate_damage(mv, attacker, defender)
-        best = max(best, frac)
-    return best
 
-def danger_score(my, opp):
-    if my is None or opp is None:
-        return 0,0
-    incoming = highest_expected_damage(opp, my)
-    dying = 1 if incoming >= hp_fraction(my) else 0
-    return incoming, dying
-
-def kill_threat_score(my, opp):
-    if my is None or opp is None:
-        return 0
-    best = 0
-    for mv in my.moves.values():
-        _,_,p_kill,_ = estimate_damage(mv,my,opp)
-        best = max(best, p_kill)
-    return best
+def stable_sigmoid(x):
+    return 1 / (1 + np.exp(-x)) if x >= 0 else np.exp(x) / (1 + np.exp(x))
 
 
-# ============================================================
-# SWITCH-SCORING FOR BENCH MONS (8 NEW FEATURES)
-# ============================================================
-def bench_switch_features(p: Pokemon, opp: Pokemon, active: Pokemon):
-    if p is None or opp is None:
-        return [0]*8
+def estimate_damage(move: Move, user: Pokemon, opp: Pokemon):
+    if move is None or user is None or opp is None:
+        return (0, 0, 0, 0)
 
-    # 1. Best damage we can do
-    best_offense = highest_expected_damage(p, opp)
-
-    # 2. Best damage opponent can do to us
-    best_defense = highest_expected_damage(opp, p)
-
-    # 3. Simple matchup score (type offense minus defense)
+    # Guard against weird missing type
     try:
-        off = max(opp.damage_multiplier(t) for t in p.types if t)
-    except:
-        off = 1.0
+        mv_name = move.id.lower()
+
+    except Exception as e:
+        print(f"[DMG ERROR] Move has no type: {move} | {e}")
+        return (0, 0, 0, 0)
+
+
+    # ----------------------------------------------------------
+    # TYPE MULTIPLIER — USE GEN9_DATA
+    # ----------------------------------------------------------
     try:
-        df = max(p.damage_multiplier(t) for t in opp.types if t)
-    except:
-        df = 1.0
-    matchup = off - df
+        eff = move.type.damage_multiplier(opp.type_1, opp.type_2, type_chart=TYPE_CHART)
+    except Exception as e:
+        print(f"[DMG ERROR] damage_multiplier failed for {mv_name}: {e}")
+        eff = 1.0
 
-    # 4. Danger on switch-in
-    danger_in, dying = danger_score(p, opp)
 
-    # 5. Kill threat
-    kt = kill_threat_score(p, opp)
+    if eff == 0:
+    
+        return (0, 0, 0, 0)
 
-    # 6. Speed advantage
-    pst = get_real_stats(p.species)
-    ost = get_real_stats(opp.species)
-    speed_adv = 1 if pst["spe"] > ost["spe"] else 0
+    # ----------------------------------------------------------
+    # STATS + BOOSTS
+    # ----------------------------------------------------------
+    try:
+        ustats = get_real_stats(user.species)
+        ostats = get_real_stats(opp.species)
+    except KeyError:
+        print(f"[DMG ERROR] Missing stats for {user.species} or {opp.species}")
+        return (0, 0, 0, 0)
 
-    # 7. Synergy with active (we use type synergy)
-    if active:
-        synergy = sum(
-            int(active.damage_multiplier(t) < 1.0)
-            for t in p.types if t
-        )
+
+    # Use .get on boosts so we never KeyError
+    if move.category.name == "PHYSICAL":
+        atk = ustats["atk"] * (2 + user.boosts.get("atk", 0)) / 2
+        defense = ostats["def"] * (2 + opp.boosts.get("def", 0)) / 2
+    elif move.category.name == "SPECIAL":
+        atk = ustats["spa"] * (2 + user.boosts.get("spa", 0)) / 2
+        defense = ostats["spd"] * (2 + opp.boosts.get("spd", 0)) / 2
+
     else:
-        synergy = 0
 
-    # 8. Predicted safe-in (1 if incoming dmg < 35%)
-    safe = 1 if danger_in < 0.35 else 0
+        return (0, 0, 0, 0)
 
-    return [
-        best_offense,
-        best_defense,
-        matchup,
-        danger_in,
-        kt,
-        speed_adv,
-        synergy,
-        safe
-    ]
+    # ----------------------------------------------------------
+    # BASE POWER
+    # ----------------------------------------------------------
+    bp = move.base_power or 0
+ 
+
+    if bp <= 0:
+        return (0, 0, 0, 0)
+
+    # ----------------------------------------------------------
+    # RAW DAMAGE CALC
+    # ----------------------------------------------------------
+    raw = ((((((2 * 100) / 5 + 2) * bp * atk / max(1, defense)) / 50) + 2) * eff)
+    raw *= 0.96
+
+  
+
+    # ----------------------------------------------------------
+    # FRACTIONAL DAMAGE
+    # ----------------------------------------------------------
+    opp_hp = opp.current_hp or opp.max_hp or 1
+    frac = raw / opp_hp
+
+
+    x1 = 12 * (raw - opp_hp) / opp_hp
+    x2 = 8 * ((2 * raw) - opp_hp) / opp_hp
+
+    return min(frac, 1.0), raw, stable_sigmoid(x1), stable_sigmoid(x2)
 
 
 # ============================================================
-# BENCH (115 features per Pokémon)
+# MOVE ENCODING (Stable + Debugged)
 # ============================================================
-def bench_list(team, active):
-    return sorted(
-        [p for p in team.values() if p is not active],
-        key=lambda p: SPECIES_INDEX.get(_norm(p.species), 999)
-    )
 
-def encode_bench(team, active, opp):
+def encode_move(move: Move, user: Pokemon, opp: Pokemon):
+    if move is None:
+        return [0] * 31
+
     vec = []
-    mons = bench_list(team, active)
 
-    for p in mons:
-        stats = get_real_stats(p.species)
+    # ---------------- TYPE ONE-HOT ----------------
+    type_vec = [0] * 18
+    try:
+        tname = move.type.name.lower()
+        if tname in TYPE_INDEX:
+            type_vec[TYPE_INDEX[tname]] = 1
+        else:
+            print(f"[MOVE WARN] Unknown move type {tname} for move {move.id}")
+    except Exception as e:
+        print(f"[MOVE ERROR] No move.type for {move.id}: {e}")
+    vec.extend(type_vec)
 
-        # Identity
-        vec.extend(species_one_hot(p))
-        vec.extend(type_one_hot(p))
+    # ---------------- CATEGORY ONE-HOT ----------------
+    cat = move.category.name.upper()
+    vec.extend([
+        1 if cat == "PHYSICAL" else 0,
+        1 if cat == "SPECIAL" else 0,
+        1 if cat == "STATUS" else 0,
+    ])
 
-        # HP + speed
-        vec.append(hp_fraction(p))
-        vec.append(hp_bucket_10(p))
-        vec.append(speed_bucket(stats["spe"]))
+    # ---------------- BASE METADATA ----------------
+    vec.append(min((move.base_power or 0) / 150, 1.0))
+    acc = move.accuracy if move.accuracy is not None else 100
+    vec.append(acc / 100)
+    vec.append(move.priority)
 
-        # Moveset (4 × 20 = 80)
-        vec.extend(encode_moveset(p, opp))
+    # ---------------- FLAGS ----------------
+    name = move.id.lower()
+    vec.append(1 if getattr(move, "secondary", None) else 0)
+    vec.append(1 if name in SETUP_MOVES else 0)
+    vec.append(1 if name in PIVOT_MOVES else 0)
+    vec.append(1 if name in RECOVERY_MOVES else 0)
+    vec.append(1 if name in PROTECT_MOVES else 0)
 
-        # NEW — switching intelligence (8)
-        vec.extend(bench_switch_features(p, opp, active))
+    vec.extend([0] * 2)  # reserved
 
-    # pad to always 5 × 115
-    EXPECTED = 5 * 115
-    if len(vec) < EXPECTED:
-        vec.extend([0]*(EXPECTED-len(vec)))
+    # ---------------- EXPECTED DAMAGE ----------------
+    dmg_frac, _, _, _ = estimate_damage(move, user, opp)
+    vec.append(dmg_frac)
 
     return vec
 
 
 # ============================================================
-# ALIVE FLAGS
+# MOVESET ENCODING — Mirroring Opponent Moves Correctly
 # ============================================================
-def encode_alive_flags(battle):
-    my = [0]*len(POKEMON_ORDER)
-    opp = [0]*len(POKEMON_ORDER)
 
-    for p in battle.team.values():
-        sid = SPECIES_INDEX.get(_norm(p.species))
-        if sid is not None:
-            my[sid] = 1 if not p.fainted else 0
+def encode_moveset_from_real_pokeenv_moves(species: str, my_team: dict, user: Pokemon, opp: Pokemon):
+    norm_species = _norm(species)
 
-    for p in battle.opponent_team.values():
-        sid = SPECIES_INDEX.get(_norm(p.species))
-        if sid is not None:
-            opp[sid] = 1 if not p.fainted else 0
+    mirror = None
+    for p in my_team.values():
+        if p and _norm(p.species) == norm_species:
+            mirror = p
+            break
 
-    return my + opp
+    source = user if mirror is None else mirror
+    moves = list(source.moves.values())
 
-
-# ============================================================
-# TURN BUCKET
-# ============================================================
-def turn_bucket(turn):
-    if turn < 5: b=0
-    elif turn <10: b=1
-    elif turn <20: b=2
-    else: b=3
-    return b/3.0
+    vec = []
+    for i in range(4):
+        mv = moves[i] if i < len(moves) else None
+        vec.extend(encode_move(mv, user, opp))
+    return vec
 
 
 # ============================================================
-# MAIN ENCODER
+# BENCH MATCHUP SCORE
 # ============================================================
+
+#def bench_matchup_score(mon: Pokemon, opp: Pokemon):
+ #   if mon is None or opp is None:
+  #      return 0.0
+   # try:
+   #     return heuristic.estimate_matchup(mon, opp)
+   # except Exception as e:
+    #    print(f"[BENCH WARN] estimate_matchup failed for {mon} vs {opp}: {e}")
+     #   return 0.0
+
+
+# ============================================================
+# SINGLE MON BLOCK
+# ============================================================
+
+def encode_single_mon_block(mon: Pokemon, opp: Pokemon, is_active: bool, my_team: dict):
+    # ---------------- ACTIVE MON BLOCK (≈120 dims) ----------------
+    if is_active and mon is not None:
+        try:
+            stats = get_real_stats(mon.species)
+        except KeyError:
+            print(f"[ENCODE WARN] Missing stats for {mon.species}, using zeros.")
+            stats = {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0, "hp": 1}
+
+        vec = []
+
+        vec.extend(type_one_hot(mon))
+        vec.append(1)                              # active flag
+        vec.append(1 if not mon.fainted else 0)    # alive flag
+
+        frac = hp_fraction(mon)
+        vec.append(frac)
+        vec.append(int(frac * 10) / 10)
+
+        vec.append(stats["spe"] / 500 if stats["spe"] else 0.0)
+
+        for s in ["atk", "def", "spa", "spd", "spe"]:
+            boost_val = mon.boosts.get(s, 0)
+            vec.append((boost_val + 6) / 12)
+
+        vec.extend(encode_moveset_from_real_pokeenv_moves(mon.species, my_team, mon, opp))
+
+        return vec[:120] + [0] * (120 - len(vec)) if len(vec) < 120 else vec[:120]
+
+    # ---------------- BENCH BLOCK (very compact) ----------------
+    if mon is None:
+        return [0, 0, 0, 0]
+
+    alive = 1 if not mon.fainted else 0
+    hp = hp_fraction(mon)
+    #matchup = bench_matchup_score(mon, opp)
+
+    try:
+        mon_stats = get_real_stats(mon.species)
+    except KeyError:
+        print(f"[ENCODE WARN] Missing stats for bench mon {mon.species}, using spe=0.")
+        mon_stats = {"spe": 0}
+
+    try:
+        opp_stats = get_real_stats(opp.species) if opp else {"spe": 0}
+    except KeyError:
+        print(f"[ENCODE WARN] Missing stats for bench opp {opp.species}, using spe=0.")
+        opp_stats = {"spe": 0}
+
+    is_faster = 1 if mon_stats.get("spe", 0) > opp_stats.get("spe", 0) else 0
+
+    return [alive, hp, is_faster]
+
+
+# ============================================================
+# TEAM ENCODING
+# ============================================================
+
+def encode_team(team_dict, active: Pokemon, opp: Pokemon, my_team):
+    out = []
+    for species in POKEMON_ORDER:
+        mon = None
+        for p in team_dict.values():
+            if _norm(p.species) == species:
+                mon = p
+                break
+        out.extend(encode_single_mon_block(mon, opp, mon is active, my_team))
+    return out
+
+
+# ============================================================
+# MAIN ENCODER ENTRYPOINT
+# ============================================================
+
 def encode_state(battle):
     my = battle.active_pokemon
     opp = battle.opponent_active_pokemon
-
-    my_stats = get_real_stats(my.species if my else None)
-    opp_stats = get_real_stats(opp.species if opp else None)
+    my_team = battle.team
 
     vec = []
 
-    # Identity
-    vec.extend(species_one_hot(my))
-    vec.extend(type_one_hot(my))
-    vec.extend(species_one_hot(opp))
-    vec.extend(type_one_hot(opp))
+    vec.extend(encode_team(battle.team, my, opp, my_team))
+    vec.extend(encode_team(battle.opponent_team, opp, my, my_team))
 
-    # HP
-    vec.append(hp_fraction(my))
-    vec.append(hp_bucket_10(my))
-    vec.append(hp_fraction(opp))
-    vec.append(hp_bucket_10(opp))
+    # Scaled turn information
+    vec.append(min(battle.turn / 30, 1.0))
 
-    # Speed
-    vec.append(speed_bucket(my_stats["spe"]))
-    vec.append(speed_bucket(opp_stats["spe"]))
-    vec.append(1 if my_stats["spe"] > opp_stats["spe"] else 0)
+    if len(vec) < MAX_FEATURES:
+        vec.extend([0] * (MAX_FEATURES - len(vec)))
 
-    # Stat buckets
-    for stat in ["atk","def","spa","spd","hp"]:
-        vec.append(stat_bucket(stat, my_stats.get(stat,0))/3.0)
-    for stat in ["atk","def","spa","spd","hp"]:
-        vec.append(stat_bucket(stat, opp_stats.get(stat,0))/3.0)
-
-    # Movesets (self + opponent)
-    vec.extend(encode_moveset(my, opp))
-    vec.extend(encode_moveset(opp, my))
-
-    # Boosts
-    for s in ["atk","def","spa","spd","spe"]:
-        vec.append((my.boosts.get(s,0)+6)/12.0)
-    for s in ["atk","def","spa","spd","spe"]:
-        vec.append((opp.boosts.get(s,0)+6)/12.0)
-
-    # Bench (5×115 each side)
-    vec.extend(encode_bench(battle.team, my, opp))
-    vec.extend(encode_bench(battle.opponent_team, opp, my))
-
-    # Alive flags
-    vec.extend(encode_alive_flags(battle))
-
-    # Danger/kill threat
-    dfrac, dying = danger_score(my, opp)
-    vec.append(dfrac)
-    vec.append(dying)
-    vec.append(kill_threat_score(my, opp))
-
-    # Turn
-    vec.append(turn_bucket(battle.turn))
-
-    return finalize_vector(vec)
+    return np.array(vec[:MAX_FEATURES], dtype=np.float32)

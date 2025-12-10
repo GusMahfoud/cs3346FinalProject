@@ -1,9 +1,7 @@
 # ============================================================
-# FIXED & CLEANED RL AGENT WITH AUTO STATE SIZE DETECTION
-# + 5-ACTION SPACE (4 MOVES + 1 SWITCH WITH HEURISTIC TARGET)
-# + PER-PHASE LR/ENTROPY CONTROL
-# + SAFE STATE SIZE MISMATCH HANDLING
-# + RETURN CLIPPING
+# rl_agent.py — Move-Only A2C Agent
+# Heuristic controls ALL switching (voluntary + involuntary)
+# Supports: warmup (no switching), phase1, phase2, phase3
 # ============================================================
 
 from poke_env.player.player import Player
@@ -17,31 +15,50 @@ from torch.utils.tensorboard import SummaryWriter
 
 from advanced_switcher import SwitchHeuristics
 from rewards import RewardCalculator
-from state_encoder import encode_state
+from state_encoder import encode_state, estimate_damage
 
-# ------------------------------------------------------------
-# ACTION SPACE: 4 moves + 1 "switch" action
-# The specific Pokémon we switch to is chosen by SwitchHeuristics
-# ------------------------------------------------------------
+
+# ============================================================
+# ACTION SPACE — 4 MOVES ONLY
+# ============================================================
+
 MOVE_ACTIONS = [0, 1, 2, 3]
-SWITCH = 4              # Single "switch" action
-ACTION_SIZE = 5         # 4 moves + 1 switch
+ACTION_SIZE = 4      # NO SWITCH ACTION
+# MUST MATCH EXACTLY move.id from PokeEnv = lowercase, no hyphens or spaces
+PRIORITY_MOVES = {
+    "iceshard", "shadowsneak", "extremespeed",
+    "machpunch", "suckerpunch"
+}
 
+BOOSTING_MOVES = {
+    "nastyplot", "swordsdance", "calmmind",
+    "quiverdance", "bulkup", "torchsong"
+}
 
+PIVOT_MOVES = {"uturn", "voltswitch", "flipturn", "partingshot", "batonpass"}
+
+STAT_DROP_MOVES = {
+    "makeitrain", "dracometeor", "overheat",
+    "leafstorm", "psychoboost"
+}
+def norm_move_id(move):
+    if move is None:
+        return ""
+    return move.id.lower().replace(" ", "").replace("-", "")
 # ============================================================
 # NETWORK
 # ============================================================
 
 class ActorCriticNet(nn.Module):
-    def __init__(self, state_size, action_size=ACTION_SIZE, hidden_size=512):
+    def __init__(self, state_size, hidden_size=512):
         super().__init__()
         self.fc1 = nn.Linear(state_size, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.policy = nn.Linear(hidden_size, action_size)
+        self.policy = nn.Linear(hidden_size, ACTION_SIZE)
         self.value = nn.Linear(hidden_size, 1)
         self.relu = nn.ReLU()
 
-        # Orthogonal initialization
+        # Initialize weights orthogonally
         nn.init.orthogonal_(self.fc1.weight, gain=np.sqrt(2))
         nn.init.orthogonal_(self.fc2.weight, gain=np.sqrt(2))
         nn.init.orthogonal_(self.policy.weight, gain=0.01)
@@ -74,114 +91,172 @@ class MyRLAgent(Player):
         entropy_coef=0.01,
         value_coef=0.5,
         batch_size=256,
-        allow_switching=False,
+        allow_switching=False,     # set by training phase
         use_expert_switching=False,
-        rl_switch_enabled=False,          # kept for compatibility (unused in 5-action setup)
-        expert_imitation_bonus=1.0,      # kept for future use if you want imitation learning
         model_folder=None,
         **kwargs
     ):
         super().__init__(battle_format=battle_format, **kwargs)
 
-        # Core hyperparams
+        # Hyperparameters
         self.gamma = gamma
         self.lr = lr
-        self.base_lr = lr  # for reference
         self.entropy_coef = entropy_coef
-        self.base_entropy_coef = entropy_coef
         self.value_coef = value_coef
         self.batch_size = batch_size
 
-        # Epsilon config (per-phase values may override)
+        # ε parameters
         self.epsilon = epsilon_start
         self.epsilon_start = epsilon_start
         self.epsilon_end = epsilon_end
         self.epsilon_decay = epsilon_decay
 
-        # Switching logic
+        # Switching control
         self.allow_switching = allow_switching
         self.use_expert_switching = use_expert_switching
-        self.rl_switch_enabled = rl_switch_enabled  # no longer selecting targets, but kept for API
-        self.expert_imitation_bonus = expert_imitation_bonus
-        self.switch_expert = SwitchHeuristics()
+        self.switcher = SwitchHeuristics()
 
-        # Reward system
+        # Reward calculator
         self.reward_calc = RewardCalculator()
+
+        # Internal tracking
         self.prev_turn = None
+        self.prev_battle_state = None
+        self.last_used_move = None
+        self.last_action_priority = False
+        self.last_action_was_switch = False
 
         # Buffers
-        # battle_history entries are ALWAYS:
-        #   (state_vec, action_index, cumulative_reward, skip_flag)
-        self.prev_battle_state = None
         self.battle_history = []
         self.episode_buffer = []
         self.experience_buffer = []
 
-        # State / caches
-        self.last_used_move = None
-        self.last_action_was_switch = False
-        self.last_action_priority = False
-
-        # NN setup
+        # Model
         self.model = None
         self.optimizer = None
-        self.state_size = None   # detected dynamically
+        self.state_size = None
 
         # TensorBoard
         self.writer = SummaryWriter(log_dir="runs/rl_training")
         self.global_train_step = 0
 
-        # Optional checkpoint folder
+        # Model load
         self.model_folder = model_folder
         if model_folder:
             self._try_load_model()
 
     # ============================================================
-    # MODEL INIT / SAVE / LOAD
+    # Model load/save/init
     # ============================================================
 
+
+    def override_with_best_damage(self, battle, chosen_move):
+        """Override RL move with best-damage option unless exempt."""
+
+        if chosen_move is None:
+            return None
+
+        me = battle.active_pokemon
+        opp = battle.opponent_active_pokemon
+
+        chosen_id = norm_move_id(chosen_move)
+
+        # ---------------------------------------------------------
+        # 1. Moves never overridden
+        # ---------------------------------------------------------
+        if (
+            chosen_id in PRIORITY_MOVES
+            or chosen_id in BOOSTING_MOVES
+            or chosen_id in PIVOT_MOVES
+        ):
+            (f"[OVERRIDE] Skip override: {chosen_id} is protected.")
+            return chosen_move
+
+        # ---------------------------------------------------------
+        # 2. Evaluate chosen move
+        # ---------------------------------------------------------
+        chosen_dmg, _, _, _ = estimate_damage(chosen_move, me, opp)
+
+        best_move = chosen_move
+        best_dmg = chosen_dmg
+
+        # ---------------------------------------------------------
+        # 3. Search for best damage move
+        # ---------------------------------------------------------
+        for mv in battle.available_moves:
+            if mv is None:
+                continue
+
+            mv_id = norm_move_id(mv)
+
+            # skip non-attacks
+            if mv.category.name == "STATUS":
+                continue
+
+            dmg, _, _, _ = estimate_damage(mv, me, opp)
+
+            if dmg > best_dmg:
+                best_dmg = dmg
+                best_move = mv
+                (f"[OVERRIDE] Better move found: {mv_id} ({dmg:.3f}) vs {chosen_id} ({chosen_dmg:.3f})")
+
+        # no change
+        if best_move == chosen_move:
+            return chosen_move
+
+        best_id = norm_move_id(best_move)
+
+        # ---------------------------------------------------------
+        # 4. Stat-drop moves require threshold advantage
+        # ---------------------------------------------------------
+        THRESHOLD = 0.25
+
+        if best_id in STAT_DROP_MOVES:
+            if not (best_dmg >= chosen_dmg * (1 + THRESHOLD)):
+                (f"[OVERRIDE] Reject stat-drop {best_id}: improvement {best_dmg:.3f} insufficient.")
+                return chosen_move
+
+        # ---------------------------------------------------------
+        # 5. Return overridden move
+        # ---------------------------------------------------------
+        
+        return best_move
+
     def _init_model(self, state_size):
-        """Called exactly once when first state arrives, or after load."""
         self.state_size = state_size
-        self.model = ActorCriticNet(state_size, action_size=ACTION_SIZE, hidden_size=512)
+        self.model = ActorCriticNet(state_size)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         print(f"[RL] Model initialized with state_size={state_size}, lr={self.lr}")
 
-    def choose_team(self, battle):
+    #def choose_team(self, battle):
         # keep your team selection logic
-        return "/team 213456"
+    #    return "/team 213456"
 
-    def teampreview(self, battle):
+   #def teampreview(self, battle):
         # keep your team preview logic
-        return "/team 213456"
-
+    #    return "/team 213456"
     def _try_load_model(self):
-        if not self.model_folder:
-            return
-
         path = os.path.join(self.model_folder, "checkpoint.pth")
         if not os.path.exists(path):
             print("[RL] No checkpoint found.")
             return
 
         ckpt = torch.load(path, map_location="cpu")
-        saved_state_size = ckpt["state_size"]
+        saved_size = ckpt["state_size"]
 
-        # ALWAYS rebuild network shape to match saved_state_size
-        self._init_model(saved_state_size)
+        self._init_model(saved_size)
 
         try:
             self.model.load_state_dict(ckpt["model"])
             self.optimizer.load_state_dict(ckpt["optimizer"])
             self.epsilon = ckpt.get("epsilon", self.epsilon)
-            print(f"[RL] Loaded checkpoint (state_size={saved_state_size}).")
+            print("[RL] Loaded checkpoint successfully.")
         except Exception as e:
-            print("[RL] ERROR loading checkpoint — mismatched dimensions or ACTION_SIZE change!")
-            print("→ Delete the old checkpoint and retrain.")
+            print("[RL] ERROR loading checkpoint.")
             print(e)
 
     def save_model(self):
-        if not self.model_folder or self.model is None:
+        if self.model is None:
             return
         os.makedirs(self.model_folder, exist_ok=True)
         ckpt = {
@@ -194,145 +269,98 @@ class MyRLAgent(Player):
         print("[RL] Model saved.")
 
     # ============================================================
-    # PHASE-LEVEL HYPERPARAM CONTROL
+    # Hyperparameter updates (per-phase)
     # ============================================================
 
-    def set_lr(self, lr: float):
-        """Update optimizer LR safely."""
+    def set_lr(self, lr):
         self.lr = lr
-        if self.optimizer is not None:
+        if self.optimizer:
             for g in self.optimizer.param_groups:
                 g["lr"] = lr
-        print(f"[RL] Learning rate set to {lr:g}")
 
-    def set_entropy_coef(self, coef: float):
+    def set_entropy_coef(self, coef):
         self.entropy_coef = coef
-        print(f"[RL] Entropy coefficient set to {coef:g}")
 
     # ============================================================
-    # LEGAL ACTIONS — 5-ACTION SPACE
+    # MOVE-ONLY ACTION SPACE
     # ============================================================
 
     def legal_actions(self, battle):
         legal = []
-
-        # Forced switch → ONLY SWITCH action
-        if (
-            battle.active_pokemon is None
-            or battle.active_pokemon.fainted
-            or battle.active_pokemon.current_hp == 0
-            or battle.force_switch
-        ):
-            return [SWITCH]
-
-        # Moves (0–3) always legal when present
         for i, m in enumerate(battle.available_moves):
             if m is not None and i < 4:
                 legal.append(i)
-
-        # Optional switching: add "SWITCH" action
-        if self.allow_switching and battle.available_switches:
-            legal.append(SWITCH)
-
         if not legal:
             return [0]
-
         return legal
 
     # ============================================================
-    # RANDOM ACTION
+    # MOVE EXECUTION
     # ============================================================
 
-    def choose_random_legal_action(self, battle):
-        legal = self.legal_actions(battle)
-        if not legal:
-            # Very defensive fallback: just random move_order()
-            return self.choose_random_move(battle)
-        a = np.random.choice(legal)
-        return self.action_to_move(a, battle)
+    def _make_move(self, action_idx, battle):
+        moves = battle.available_moves
 
-    # ============================================================
-    # HEURISTIC SWITCH PICKER — USES advanced_switcher
-    # ============================================================
-
-    def pick_best_switch_target(self, battle):
-        """Choose the best Pokémon to switch into using the SwitchHeuristics."""
-        try:
-            best = self.switch_expert.best_switch_target(battle)
-            if best is not None:
-                return best
-        except Exception:
-            pass
-
-        # Fallback: first available switch target
-        for mon in battle.available_switches:
-            if mon is not None:
-                return mon
-
-        return None
-
-    # ============================================================
-    # ACTION → MOVE (4 moves + 1 heuristic switch)
-    # ============================================================
-
-    def action_to_move(self, action, battle):
-        # MOVE (0–3)
-        if action in MOVE_ACTIONS:
-            moves = battle.available_moves
-            if action < len(moves) and moves[action] is not None:
-                m = moves[action]
-                self.last_used_move = m
-                self.last_action_was_switch = False
-                self.last_action_priority = (m.priority > 0)
-                return self.create_order(m)
-
-            # Fallback: first valid move
+        # ------------------------------------------------------------
+        # 1. If action index maps to a real move, pick it (RL choice)
+        # ------------------------------------------------------------
+        if action_idx < len(moves) and moves[action_idx] is not None:
+            chosen = moves[action_idx]
+        else:
+            # fallback: just pick first available move
+            chosen = None
             for m in moves:
                 if m is not None:
-                    self.last_used_move = m
-                    self.last_action_was_switch = False
-                    self.last_action_priority = (m.priority > 0)
-                    return self.create_order(m)
+                    chosen = m
+                    break
 
-        # SWITCH (4)
-        if action == SWITCH:
-            best = self.pick_best_switch_target(battle)
-            if best is not None:
-                self.last_used_move = None
-                self.last_action_was_switch = True
-                self.last_action_priority = False
-                return self.create_order(best)
+            if chosen is None:
+                return self.choose_random_move(battle)
 
-            # Fallback to random
-            return self.choose_random_legal_action(battle)
+        # ------------------------------------------------------------
+        # 2. Apply override heuristic AFTER RL picks the move
+        # ------------------------------------------------------------
+        overridden = self.override_with_best_damage(battle, chosen)
 
-        # Catastrophic fallback
-        return self.choose_random_legal_action(battle)
+        # ------------------------------------------------------------
+        # 3. Store this as the move actually taken (critical for PPO)
+        # ------------------------------------------------------------
+        final_move = overridden
+
+        # RL must learn that THIS was the selected action
+        self.last_used_move = final_move
+        self.last_action_priority = final_move.priority > 0
+        self.last_action_was_switch = False
+
+        return self.create_order(final_move)
 
     # ============================================================
-    # CHOOSE MOVE (MAIN)
+    # SWITCH HANDLING — ALWAYS HEURISTIC CONTROL
+    # ============================================================
+
+    def _do_switch(self, battle, voluntary: bool):
+        try:
+            target = self.switcher.best_switch_target(battle, voluntary=voluntary)
+        except Exception:
+            target = None
+
+        self.last_used_move = None
+        self.last_action_was_switch = True
+        self.last_action_priority = False
+
+        if target:
+            return self.create_order(target)
+
+        # fallback random
+        return self.choose_random_move(battle)
+
+    # ============================================================
+    # MAIN DECISION FUNCTION
     # ============================================================
 
     def choose_move(self, battle):
-        """
-        Main decision logic.
-
-        Key invariants:
-        - battle_history ALWAYS stores 4-tuples (s, a, cumulative_r, skip_flag)
-        - RewardCalculator:
-            * compute_turn_reward(prev_state, current_state, last_action_was_switch)
-              is called on EVERY decision after the first.
-            * flush() is only called when the SHOWDOWN TURN changes.
-              The flushed reward is added to the LAST logged (s, a, r, skip).
-        - Forced switches + expert switches are logged with skip_flag=True
-          so they don't go into the RL experience buffer.
-        """
-
-        current_turn = battle.turn
-
-        # --------------------------------------------------------
-        # 1. Turn-level reward from previous transition
-        # --------------------------------------------------------
+        turn_now = battle.turn
+        # reward delivery between prev_state → battle
         if self.prev_battle_state is not None:
             self.reward_calc.compute_turn_reward(
                 self.prev_battle_state,
@@ -341,108 +369,67 @@ class MyRLAgent(Player):
                 last_used_move=self.last_used_move,
             )
 
-        # Flush turn-level reward if turn advanced
-        if self.prev_turn is not None and current_turn != self.prev_turn:
+        # flush reward when turn increments
+        if self.prev_turn is not None and turn_now != self.prev_turn:
             if self.battle_history:
                 r = self.reward_calc.flush()
                 s, a, old, skip = self.battle_history[-1]
                 self.battle_history[-1] = (s, a, old + r, skip)
 
-        self.prev_turn = current_turn
+        self.prev_turn = turn_now
 
-        # --------------------------------------------------------
-        # 2. Encode current state
-        # --------------------------------------------------------
-        raw_state_vec = encode_state(battle).astype(np.float32)
-
-        # If model already exists, but encoder changed length, pad/truncate safely.
-        if self.model is not None and self.state_size is not None:
-            if len(raw_state_vec) != self.state_size:
-                fixed = np.zeros(self.state_size, dtype=np.float32)
-                n = min(self.state_size, len(raw_state_vec))
-                fixed[:n] = raw_state_vec[:n]
-                state_vec = fixed
-            else:
-                state_vec = raw_state_vec
-        else:
-            state_vec = raw_state_vec
-
-        # Initialize model on first ever state
+        # Encode state
+        raw = encode_state(battle).astype(np.float32)
         if self.model is None:
-            print(f"[RL] Detected state_vec size = {len(state_vec)}")
-            self._init_model(len(state_vec))
+            self._init_model(len(raw))
+        elif len(raw) != self.state_size:
+            fixed = np.zeros(self.state_size, dtype=np.float32)
+            fixed[:min(self.state_size, len(raw))] = raw[:min(self.state_size, len(raw))]
+            raw = fixed
 
-        # --------------------------------------------------------
-        # 3. Forced switch handling (KO, phazing, etc.)
-        # --------------------------------------------------------
-        forced_switch = (
+        state_vec = raw
+
+        # ========================================================
+        # FORCED SWITCH (KO, phazing, etc.) → involuntary
+        # ========================================================
+        forced = (
             battle.active_pokemon is None
             or battle.active_pokemon.fainted
             or battle.force_switch
             or battle.active_pokemon.current_hp == 0
         )
 
-        if forced_switch:
-            best = self.pick_best_switch_target(battle)
-
-            # Log as skip=True (expert / forced behavior)
-            self.battle_history.append((state_vec.copy(), SWITCH, 0.0, True))
-
-            self.last_used_move = None
-            self.last_action_was_switch = True
-            self.last_action_priority = False
+        if forced:
+            self.battle_history.append((state_vec.copy(), -1, 0.0, True))
+            move = self._do_switch(battle, voluntary=False)
             self.prev_battle_state = battle
-
-            if best is not None:
-                return self.create_order(best)
-
-            return self.choose_random_legal_action(battle)
-
-        # --------------------------------------------------------
-        # 4. Normal turn — compute legal actions
-        # --------------------------------------------------------
-        legal = self.legal_actions(battle)
-        if not legal:
-            move = self.choose_random_legal_action(battle)
-            self.battle_history.append((state_vec.copy(), 0, 0.0, False))
-            self.prev_battle_state = battle
-            self.last_action_was_switch = False
             return move
 
-        # --------------------------------------------------------
-        # 5. Expert voluntary switching (if enabled)
-        # --------------------------------------------------------
-        if (
-            self.allow_switching
-            and self.use_expert_switching
-            and SWITCH in legal
-        ):
+        # ========================================================
+        # VOLUNTARY SWITCH (PHASE 1/2/3)
+        # ========================================================
+        if self.allow_switching and self.use_expert_switching:
             try:
-                if self.switch_expert.should_switch_out(battle):
-                    best = self.pick_best_switch_target(battle)
-                    if best is not None:
-                        # Log expert decision as skip=True (no RL credit)
-                        self.battle_history.append((state_vec.copy(), SWITCH, 0.0, True))
-
-                        self.prev_battle_state = battle
-                        self.last_used_move = None
-                        self.last_action_was_switch = True
-                        self.last_action_priority = False
-
-                        return self.create_order(best)
-            except Exception:
-                # If heuristic fails, we'll just let RL decide
+                shouldSwitch=self.switcher.should_switch_out(battle)
+                if shouldSwitch:
+                    self.battle_history.append((state_vec.copy(), -1, 0.0, True))
+                    move = self._do_switch(battle, voluntary=True)
+                    self.prev_battle_state = battle
+                    return move
+            except Exception as e:
+                import traceback
+                print("[SWITCH ERROR]", e)
+                traceback.print_exc()
                 pass
 
-        # --------------------------------------------------------
-        # 6. RL decision (ε-greedy over {0,1,2,3,4})
-        # --------------------------------------------------------
+        # ========================================================
+        # RL MOVE DECISION
+        # ========================================================
+        legal = self.legal_actions(battle)
+
         if np.random.random() < self.epsilon:
-            # Exploration
             action = np.random.choice(legal)
-            move = self.action_to_move(action, battle)
         else:
-            # Policy
             st = torch.FloatTensor(state_vec).unsqueeze(0)
             self.model.eval()
             with torch.no_grad():
@@ -450,41 +437,32 @@ class MyRLAgent(Player):
                 probs = torch.softmax(logits, dim=1).squeeze().numpy()
 
             mask = np.zeros_like(probs)
-            mask[legal] = probs[legal]
+            mask[:4] = probs[:4]
+            mask = mask[legal]
 
             if mask.sum() == 0:
                 action = np.random.choice(legal)
             else:
-                mask /= mask.sum()
-                # Simple temperature schedule tied to epsilon
-                temp = max(0.3, float(self.epsilon))
-                dist = mask ** (1.0 / temp)
-                dist_sum = dist.sum()
-                if dist_sum <= 0:
-                    action = np.random.choice(legal)
-                else:
-                    dist /= dist_sum
-                    action = np.random.choice(len(dist), p=dist)
+                action = np.random.choice(
+                    legal,
+                    p=mask / mask.sum()
+                )
 
-            move = self.action_to_move(action, battle)
+        move = self._make_move(action, battle)
+        # Determine final move index (so RL learns correctly)
+        final_idx = battle.available_moves.index(self.last_used_move)
 
-        # --------------------------------------------------------
-        # 7. Log RL-chosen action (skip=False → used for training)
-        # --------------------------------------------------------
-        self.battle_history.append((state_vec.copy(), action, 0.0, False))
+        self.battle_history.append((state_vec.copy(), final_idx, 0.0, False))
         self.prev_battle_state = battle
-
         return move
 
     # ============================================================
-    # BATTLE END
+    # BATTLE END → Compute returns + training
     # ============================================================
-
     def _battle_finished_callback(self, battle):
         self.on_battle_end(battle)
-
     def on_battle_end(self, battle):
-        # Final transition reward (prev_battle_state -> terminal battle)
+        # finalize transition
         if self.prev_battle_state is not None:
             self.reward_calc.compute_turn_reward(
                 self.prev_battle_state,
@@ -493,24 +471,24 @@ class MyRLAgent(Player):
                 last_used_move=self.last_used_move,
             )
 
-        # Flush remaining turn-level reward into last action
+        # apply turn flush
         if self.battle_history:
             r = self.reward_calc.flush()
             s, a, old, skip = self.battle_history[-1]
             self.battle_history[-1] = (s, a, old + r, skip)
 
-        # Terminal reward (win/loss, etc.)
+        # terminal reward
         term = self.reward_calc.compute_terminal_reward(battle)
         if self.battle_history:
             s, a, old, skip = self.battle_history[-1]
             self.battle_history[-1] = (s, a, old + term, skip)
 
-        # Store full episode & convert into experience
+        # Store full episode
         if self.battle_history:
             self.episode_buffer.append(self.battle_history.copy())
             self._process_episodes()
 
-        # Reset per-battle state
+        # Reset
         self.reward_calc.reset()
         self.battle_history = []
         self.prev_battle_state = None
@@ -519,34 +497,32 @@ class MyRLAgent(Player):
         self.last_action_priority = False
         self.prev_turn = None
 
-        # ε decay: once per battle
+        # epsilon decay
         self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
 
-        # Train if we have a full batch
+        # train if ready
         if len(self.experience_buffer) >= self.batch_size:
             self._train_batch()
 
     # ============================================================
-    # PROCESS EPISODES
+    # EPISODE PROCESSING
     # ============================================================
 
     def _process_episodes(self):
         while self.episode_buffer:
             ep = self.episode_buffer.pop(0)
 
-            # Compute returns (backwards)
             G = 0.0
             returns = []
-            for (_, _, r, skip) in reversed(ep):
+
+            for (_, _, r, _) in reversed(ep):
                 G = r + self.gamma * G
                 returns.insert(0, G)
 
-            # Push non-expert examples only (skip_flag=False)
-            for (s, a, r, skip_flag), R in zip(ep, returns):
-                if not skip_flag:
-                    # Mild return clipping for stability
-                    R_clipped = max(-10.0, min(10.0, R))
-                    self.experience_buffer.append((s, a, R_clipped))
+            for (s, a, r, skip), R in zip(ep, returns):
+                if not skip:  # ignore heuristic switches
+                    R = max(-10, min(10, R))
+                    self.experience_buffer.append((s, a, R))
 
     # ============================================================
     # TRAINING
@@ -560,7 +536,6 @@ class MyRLAgent(Player):
         actions = np.array([b[1] for b in batch], dtype=np.int64)
         returns = np.array([b[2] for b in batch], dtype=np.float32)
 
-        # Normalize returns
         returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
         st = torch.FloatTensor(states)
@@ -571,13 +546,12 @@ class MyRLAgent(Player):
         probs = torch.softmax(logits, dim=1)
         log_probs = torch.log(probs + 1e-8)
 
-        selected_log = log_probs[range(len(at)), at]
+        selected = log_probs[range(len(at)), at]
 
-        # Advantage
         adv = rt - values.detach()
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        policy_loss = -(selected_log * adv).mean()
+        policy_loss = -(selected * adv).mean()
         value_loss = F.mse_loss(values, rt)
         entropy = -(probs * log_probs).sum(dim=1).mean()
 
@@ -588,12 +562,11 @@ class MyRLAgent(Player):
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
-        # Logging
+        # logging
         self.writer.add_scalar("Loss/Total", loss.item(), self.global_train_step)
         self.writer.add_scalar("Loss/Policy", policy_loss.item(), self.global_train_step)
         self.writer.add_scalar("Loss/Value", value_loss.item(), self.global_train_step)
         self.writer.add_scalar("Entropy", entropy.item(), self.global_train_step)
         self.writer.add_scalar("Epsilon", self.epsilon, self.global_train_step)
-        self.writer.add_scalar("LR", self.lr, self.global_train_step)
 
         self.global_train_step += 1
