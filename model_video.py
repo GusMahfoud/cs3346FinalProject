@@ -52,6 +52,7 @@ async def run_showcase_battle():
 
     print("\n=== STARTING VISIBLE BATTLE ===")
     print("Open the URL shown below in your browser.\n")
+    print("http://localhost:8000/")
 
     # Run exactly *one* battle and do not close it prematurely
     await rl_agent.battle_against(opponent, n_battles=1)
