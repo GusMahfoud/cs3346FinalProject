@@ -1,4 +1,4 @@
-Reinforcement Learning for Pokémon Showdown (Mac Setup Guide)
+# Reinforcement Learning for Pokémon Showdown (Mac Setup Guide)
 
 This project trains and evaluates a reinforcement learning (RL) agent in the Pokémon Showdown battle simulator using the poke-env library.
 
