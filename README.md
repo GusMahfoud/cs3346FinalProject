@@ -46,8 +46,11 @@ brew install git python@3.11 node
 Check versions:
 
 git --version
+
 python3.11 --version
+
 node --version
+
 npm --version
 
 ---
@@ -55,13 +58,17 @@ npm --version
 ### 2. Clone the Repository
 
 cd ~
-git clone https://github.com/GusMahfoud/cs3346FinalProject.git cs3346FinalProject
+
+git clone https://github.com/GusMahfoud/cs3346FinalProject.git
+
 cd cs3346FinalProject
 
 ### 3. Create and Activate a Virtual Environment (Python 3.11)
 
 python3.11 -m venv .venv
+
 source .venv/bin/activate
+
 python --version
 
 Expect: `Python 3.11.x`
@@ -71,6 +78,7 @@ Expect: `Python 3.11.x`
 ### 4. Install Python Dependencies
 
 python -m pip install --upgrade pip setuptools wheel
+
 pip install -r requirements.txt
 
 If needed manually:
@@ -101,6 +109,7 @@ python model_video.py
 Look for:
 
 Showdown responded — server ready.
+
 Server running at ws://localhost:8000/
 
 Then open the printed URL and click the battle in the top-right.(Watch video for clarifcation)
@@ -143,8 +152,11 @@ You’ll need:
 Verify versions:
 
 git --version
+
 python --version
+
 node --version
+
 npm --version
 
 
@@ -153,7 +165,9 @@ npm --version
 ### 2. Clone the Repository (Windows)
 
 cd C:
-git clone https://github.com/GusMahfoud/cs3346FinalProject.git cs3346FinalProject
+
+git clone https://github.com/GusMahfoud/cs3346FinalProject.git
+
 cd cs3346FinalProject
 
 ---
@@ -161,10 +175,13 @@ cd cs3346FinalProject
 ### 3. Create and Activate Virtual Environment (Python 3.11)
 
 python -m venv .venv
+
 .venv\Scripts\activate
+
 python --version
 
 Deactivate:
+
 deactivate
 
 
@@ -173,9 +190,11 @@ deactivate
 ### 4. Install Python Dependencies
 
 python -m pip install --upgrade pip setuptools wheel
+
 pip install -r requirements.txt
 
 Or manually:
+
 pip install torch poke-env tensorboard numpy matplotlib opencv-python
 
 ---
@@ -196,10 +215,13 @@ pip install torch poke-env tensorboard numpy matplotlib opencv-python
 python model_video.py
 
 Expect output:
+
 Showdown responded — server ready.
+
 Server running at ws://localhost:8000/
 
 Long paths → `listen EINVAL`  
+
 Fix: move to `C:\cs3346FinalProject`
 
 ---
@@ -207,6 +229,7 @@ Fix: move to `C:\cs3346FinalProject`
 ### 7. Training the RL Agent (Optional)
 
 python train_parallel.py
+
 Stop with **Ctrl + C**.
 
 ---
